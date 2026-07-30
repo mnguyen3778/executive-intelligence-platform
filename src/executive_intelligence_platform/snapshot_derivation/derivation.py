@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from types import MappingProxyType
-from typing import Any, Mapping
+from typing import Any
 
 from executive_intelligence_platform.snapshot_catalog import (
     SnapshotAdmissionMetadata,
@@ -216,12 +216,12 @@ def _validate_catalog_entry(
                 "Catalog admission source component lineage is incomplete.",
             )
         )
-    if not isinstance(catalog_entry.snapshot_evidence, Mapping):
+    if not isinstance(catalog_entry.snapshot_evidence, MappingProxyType):
         issues.append(
             _issue(
                 "missing-snapshot-evidence",
                 "$.catalogEntry.snapshotEvidence",
-                "Catalog entry must contain preserved snapshot evidence.",
+                "Catalog entry must contain preserved immutable snapshot evidence.",
             )
         )
 
