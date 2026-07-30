@@ -1,0 +1,39 @@
+"""Website-facing delivery contract for Executive Intelligence Projections."""
+
+from .delivery import (
+    WEBSITE_PROJECTION_DELIVERY_CONTRACT_VERSION,
+    WEBSITE_PROJECTION_DELIVERY_FAILURE_REASON_CODES,
+    WEBSITE_PROJECTION_DELIVERY_PUBLICATION_POLICY_VERSION,
+    WebsiteProjectionDelivery,
+    WebsiteProjectionDeliveryClassification,
+    WebsiteProjectionDeliveryCompatibility,
+    WebsiteProjectionDeliveryEligibility,
+    WebsiteProjectionDeliveryIssue,
+    WebsiteProjectionDeliveryLineage,
+    WebsiteProjectionDeliveryMetadata,
+    WebsiteProjectionDeliveryPublisher,
+    WebsiteProjectionDeliveryRequest,
+    WebsiteProjectionDeliveryResult,
+    WebsiteProjectionDeliveryVersionContext,
+    WebsiteProjectionLimitations,
+    WebsiteProjectionPublication,
+)
+
+__all__ = [
+    "WEBSITE_PROJECTION_DELIVERY_CONTRACT_VERSION",
+    "WEBSITE_PROJECTION_DELIVERY_FAILURE_REASON_CODES",
+    "WEBSITE_PROJECTION_DELIVERY_PUBLICATION_POLICY_VERSION",
+    "WebsiteProjectionDelivery",
+    "WebsiteProjectionDeliveryClassification",
+    "WebsiteProjectionDeliveryCompatibility",
+    "WebsiteProjectionDeliveryEligibility",
+    "WebsiteProjectionDeliveryIssue",
+    "WebsiteProjectionDeliveryLineage",
+    "WebsiteProjectionDeliveryMetadata",
+    "WebsiteProjectionDeliveryPublisher",
+    "WebsiteProjectionDeliveryRequest",
+    "WebsiteProjectionDeliveryResult",
+    "WebsiteProjectionDeliveryVersionContext",
+    "WebsiteProjectionLimitations",
+    "WebsiteProjectionPublication",
+]
