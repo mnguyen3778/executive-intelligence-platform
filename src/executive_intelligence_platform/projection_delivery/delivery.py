@@ -9,6 +9,7 @@ assemble packages, create projections, or implement Website behavior.
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Any
@@ -75,6 +76,14 @@ ALLOWED_CLASSIFICATIONS = (
     "portal_operational",
     "client_confidential",
     "restricted_assessment",
+)
+ALLOWED_DASHBOARD_CONTENT_SECTIONS = (
+    "summaries",
+    "metrics",
+    "findings",
+    "risks",
+    "recommendations",
+    "decisions",
 )
 DEFAULT_FIELD_CLASSIFICATIONS = (
     ("deliveryMetadata", "portal_operational"),
@@ -186,6 +195,81 @@ class WebsiteProjectionDeliveryIssue:
 
 
 @dataclass(frozen=True)
+class WebsiteProjectionDisplayField:
+    label: str
+    value: str | int | float | bool
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "label": self.label,
+            "value": self.value,
+        }
+
+
+@dataclass(frozen=True)
+class WebsiteProjectionContentItem:
+    label: str
+    fields: tuple[WebsiteProjectionDisplayField, ...]
+    value: str | int | float | bool | None = None
+    unit: str | None = None
+    status: str | None = None
+    summary: str | None = None
+    description: str | None = None
+    semantic_intent: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        item: dict[str, Any] = {
+            "label": self.label,
+            "fields": [field.to_dict() for field in self.fields],
+        }
+        optional_fields = (
+            ("value", self.value),
+            ("unit", self.unit),
+            ("status", self.status),
+            ("summary", self.summary),
+            ("description", self.description),
+            ("semanticIntent", self.semantic_intent),
+        )
+        for key, value in optional_fields:
+            if value is not None:
+                item[key] = value
+        return item
+
+
+@dataclass(frozen=True)
+class WebsiteProjectionContentSection:
+    label: str
+    items: tuple[WebsiteProjectionContentItem, ...]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "label": self.label,
+            "items": [item.to_dict() for item in self.items],
+        }
+
+
+@dataclass(frozen=True)
+class WebsiteProjectionDashboardContent:
+    sections: tuple[tuple[str, WebsiteProjectionContentSection], ...]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            section_name: section.to_dict()
+            for section_name, section in self.sections
+        }
+
+
+@dataclass(frozen=True)
+class WebsiteProjectionRenderingGuidance:
+    section_order: tuple[str, ...]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "sectionOrder": list(self.section_order),
+        }
+
+
+@dataclass(frozen=True)
 class WebsiteProjectionDeliveryRequest:
     delivery_contract_version: str = WEBSITE_PROJECTION_DELIVERY_CONTRACT_VERSION
     publication_policy_version: str = (
@@ -204,9 +288,11 @@ class WebsiteProjectionDeliveryRequest:
     field_classifications: tuple[tuple[str, str], ...] = (
         DEFAULT_FIELD_CLASSIFICATIONS
     )
+    dashboard_content: WebsiteProjectionDashboardContent | None = None
+    rendering_guidance: WebsiteProjectionRenderingGuidance | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        request = {
             "deliveryContractVersion": self.delivery_contract_version,
             "publicationPolicyVersion": self.publication_policy_version,
             "projectionEligibleForDashboard": (
@@ -226,6 +312,11 @@ class WebsiteProjectionDeliveryRequest:
                 for field_group, classification in self.field_classifications
             ],
         }
+        if self.dashboard_content is not None:
+            request["dashboardContent"] = self.dashboard_content.to_dict()
+        if self.rendering_guidance is not None:
+            request["renderingGuidance"] = self.rendering_guidance.to_dict()
+        return request
 
 
 @dataclass(frozen=True)
@@ -468,9 +559,11 @@ class WebsiteProjectionDelivery:
     lineage: WebsiteProjectionDeliveryLineage
     classification: WebsiteProjectionDeliveryClassification
     limitations: WebsiteProjectionLimitations
+    dashboard_content: WebsiteProjectionDashboardContent | None = None
+    rendering_guidance: WebsiteProjectionRenderingGuidance | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        delivery = {
             "deliveryMetadata": self.delivery_metadata.to_dict(),
             "projectionReference": {
                 "producerSnapshotIdentity": (
@@ -491,6 +584,11 @@ class WebsiteProjectionDelivery:
             "classification": self.classification.to_dict(),
             "limitations": self.limitations.to_dict(),
         }
+        if self.dashboard_content is not None:
+            delivery["dashboardContent"] = self.dashboard_content.to_dict()
+        if self.rendering_guidance is not None:
+            delivery["renderingGuidance"] = self.rendering_guidance.to_dict()
+        return delivery
 
 
 @dataclass(frozen=True)
@@ -775,6 +873,46 @@ def _validate_request(
                 "Field classifications must be approved Website classifications.",
             )
         )
+    if request.dashboard_content is not None:
+        if not _field_group_classified(
+            request.field_classifications,
+            "dashboardContent",
+        ):
+            issues.append(
+                _issue(
+                    "classification-not-approved",
+                    "$.request.fieldClassifications.dashboardContent",
+                    "Dashboard content requires an approved classification.",
+                )
+            )
+        if not _valid_dashboard_content(request.dashboard_content):
+            issues.append(
+                _issue(
+                    "delivery-payload-malformed",
+                    "$.request.dashboardContent",
+                    "Dashboard content must use approved immutable sections.",
+                )
+            )
+    if request.rendering_guidance is not None:
+        if not _field_group_classified(
+            request.field_classifications,
+            "renderingGuidance",
+        ):
+            issues.append(
+                _issue(
+                    "classification-not-approved",
+                    "$.request.fieldClassifications.renderingGuidance",
+                    "Rendering guidance requires an approved classification.",
+                )
+            )
+        if not _valid_rendering_guidance(request.rendering_guidance):
+            issues.append(
+                _issue(
+                    "delivery-payload-malformed",
+                    "$.request.renderingGuidance",
+                    "Rendering guidance must use approved section ordering.",
+                )
+            )
 
     return issues
 
@@ -1068,6 +1206,8 @@ def _build_delivery(
             limitation_visibility_state=request.limitation_visibility_state,
             limitation_indicators=tuple(request.limitations),
         ),
+        dashboard_content=request.dashboard_content,
+        rendering_guidance=request.rendering_guidance,
     )
 
 
@@ -1089,6 +1229,112 @@ def _valid_field_classifications(value: object) -> bool:
         if classification not in ALLOWED_CLASSIFICATIONS:
             return False
     return True
+
+
+def _field_group_classified(
+    field_classifications: tuple[tuple[str, str], ...],
+    field_group: str,
+) -> bool:
+    if not isinstance(field_classifications, tuple):
+        return False
+    for item in field_classifications:
+        if not isinstance(item, tuple) or len(item) != 2:
+            return False
+        classified_group, classification = item
+        if (
+            classified_group == field_group
+            and classification in ALLOWED_CLASSIFICATIONS
+        ):
+            return True
+    return False
+
+
+def _valid_dashboard_content(value: object) -> bool:
+    if not isinstance(value, WebsiteProjectionDashboardContent):
+        return False
+    if not isinstance(value.sections, tuple) or not value.sections:
+        return False
+
+    seen_section_names: set[str] = set()
+    for item in value.sections:
+        if not isinstance(item, tuple) or len(item) != 2:
+            return False
+        section_name, section = item
+        if section_name not in ALLOWED_DASHBOARD_CONTENT_SECTIONS:
+            return False
+        if section_name in seen_section_names:
+            return False
+        seen_section_names.add(section_name)
+        if not _valid_dashboard_section(section):
+            return False
+    return True
+
+
+def _valid_dashboard_section(value: object) -> bool:
+    if not isinstance(value, WebsiteProjectionContentSection):
+        return False
+    if not isinstance(value.label, str) or not value.label.strip():
+        return False
+    if not isinstance(value.items, tuple) or not value.items:
+        return False
+    return all(_valid_dashboard_item(item) for item in value.items)
+
+
+def _valid_dashboard_item(value: object) -> bool:
+    if not isinstance(value, WebsiteProjectionContentItem):
+        return False
+    if not isinstance(value.label, str) or not value.label.strip():
+        return False
+    if not isinstance(value.fields, tuple) or not value.fields:
+        return False
+    if not all(_valid_dashboard_field(field) for field in value.fields):
+        return False
+    optional_strings = (
+        value.unit,
+        value.status,
+        value.summary,
+        value.description,
+        value.semantic_intent,
+    )
+    if any(
+        item is not None and (not isinstance(item, str) or not item.strip())
+        for item in optional_strings
+    ):
+        return False
+    return value.value is None or _valid_display_value(value.value)
+
+
+def _valid_dashboard_field(value: object) -> bool:
+    if not isinstance(value, WebsiteProjectionDisplayField):
+        return False
+    if not isinstance(value.label, str) or not value.label.strip():
+        return False
+    return _valid_display_value(value.value)
+
+
+def _valid_display_value(value: object) -> bool:
+    if isinstance(value, bool):
+        return True
+    if isinstance(value, str):
+        return bool(value.strip())
+    if isinstance(value, int):
+        return True
+    if isinstance(value, float):
+        return math.isfinite(value)
+    return False
+
+
+def _valid_rendering_guidance(value: object) -> bool:
+    if not isinstance(value, WebsiteProjectionRenderingGuidance):
+        return False
+    if not isinstance(value.section_order, tuple) or not value.section_order:
+        return False
+    if not all(
+        section_name in ALLOWED_DASHBOARD_CONTENT_SECTIONS
+        for section_name in value.section_order
+    ):
+        return False
+    return len(value.section_order) == len(set(value.section_order))
 
 
 def _find_prohibited_key(value: object, path: str = "$") -> str | None:

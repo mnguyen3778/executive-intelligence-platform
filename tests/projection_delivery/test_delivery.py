@@ -29,6 +29,11 @@ from executive_intelligence_platform.projection_delivery import (  # noqa: E402
     WebsiteProjectionDeliveryContractPublisher,
     WebsiteProjectionDeliveryPublisher,
     WebsiteProjectionDeliveryRequest,
+    WebsiteProjectionContentItem,
+    WebsiteProjectionContentSection,
+    WebsiteProjectionDashboardContent,
+    WebsiteProjectionDisplayField,
+    WebsiteProjectionRenderingGuidance,
 )
 from executive_intelligence_platform.snapshot_catalog import (  # noqa: E402
     SnapshotCatalog,
@@ -42,6 +47,19 @@ from executive_intelligence_platform.snapshot_derivation import (  # noqa: E402
 
 
 PRODUCER_SNAPSHOT_IDENTITY = "assessment-service-snapshot-001"
+APPROVED_FIELD_CLASSIFICATIONS = (
+    ("deliveryMetadata", "portal_operational"),
+    ("projectionReference", "portal_operational"),
+    ("publication", "portal_operational"),
+    ("eligibility", "portal_operational"),
+    ("compatibility", "portal_operational"),
+    ("versionContext", "portal_operational"),
+    ("lineage", "portal_operational"),
+    ("classification", "portal_operational"),
+    ("limitations", "portal_operational"),
+    ("dashboardContent", "restricted_assessment"),
+    ("renderingGuidance", "portal_operational"),
+)
 
 
 def valid_snapshot():
@@ -148,6 +166,67 @@ def delivery_result(request=None, projection=None):
 def published_contract_instance(delivery=None):
     return WebsiteProjectionDeliveryContractPublisher().publish(
         delivery_result() if delivery is None else delivery
+    )
+
+
+def approved_dashboard_content():
+    return WebsiteProjectionDashboardContent(
+        sections=(
+            (
+                "summaries",
+                WebsiteProjectionContentSection(
+                    label="Executive Summary",
+                    items=(
+                        WebsiteProjectionContentItem(
+                            label="Governed Status",
+                            summary="Approved projection content supplied by EIP.",
+                            semantic_intent="status_summary",
+                            fields=(
+                                WebsiteProjectionDisplayField(
+                                    label="Status",
+                                    value="Published",
+                                ),
+                            ),
+                        ),
+                    ),
+                ),
+            ),
+            (
+                "metrics",
+                WebsiteProjectionContentSection(
+                    label="Version Metrics",
+                    items=(
+                        WebsiteProjectionContentItem(
+                            label="Contract Version",
+                            value=1,
+                            unit="version",
+                            fields=(
+                                WebsiteProjectionDisplayField(
+                                    label="Delivery Contract",
+                                    value=WEBSITE_PROJECTION_DELIVERY_CONTRACT_VERSION,
+                                ),
+                            ),
+                        ),
+                    ),
+                ),
+            ),
+        )
+    )
+
+
+def approved_rendering_guidance():
+    return WebsiteProjectionRenderingGuidance(
+        section_order=("summaries", "metrics"),
+    )
+
+
+def delivery_result_with_content():
+    return delivery_result(
+        WebsiteProjectionDeliveryRequest(
+            field_classifications=APPROVED_FIELD_CLASSIFICATIONS,
+            dashboard_content=approved_dashboard_content(),
+            rendering_guidance=approved_rendering_guidance(),
+        )
     )
 
 
@@ -751,6 +830,191 @@ class WebsiteProjectionDeliveryTests(unittest.TestCase):
             first.contract_instance.serialize(),
             second.contract_instance.serialize(),
         )
+
+    def test_delivery_omits_dashboard_content_when_not_explicitly_supplied(self):
+        payload = delivery_result().delivery.to_dict()
+
+        self.assertNotIn("dashboardContent", payload)
+        self.assertNotIn("renderingGuidance", payload)
+
+    def test_delivery_preserves_explicit_dashboard_content(self):
+        result = delivery_result_with_content()
+
+        self.assertTrue(result.delivered)
+        payload = result.delivery.to_dict()
+
+        self.assertEqual(
+            payload["dashboardContent"],
+            approved_dashboard_content().to_dict(),
+        )
+        self.assertEqual(
+            payload["dashboardContent"]["summaries"]["items"][0]["summary"],
+            "Approved projection content supplied by EIP.",
+        )
+
+    def test_delivery_preserves_explicit_rendering_guidance(self):
+        result = delivery_result_with_content()
+
+        self.assertTrue(result.delivered)
+        payload = result.delivery.to_dict()
+
+        self.assertEqual(
+            payload["renderingGuidance"],
+            approved_rendering_guidance().to_dict(),
+        )
+        self.assertEqual(
+            payload["renderingGuidance"]["sectionOrder"],
+            ["summaries", "metrics"],
+        )
+
+    def test_published_contract_preserves_dashboard_content_and_guidance(self):
+        source_delivery_result = delivery_result_with_content()
+
+        publication = published_contract_instance(source_delivery_result)
+        contract_payload = publication.contract_instance.to_dict()
+        delivery_payload = source_delivery_result.delivery.to_dict()
+
+        self.assertTrue(publication.published)
+        self.assertEqual(
+            contract_payload["dashboardContent"],
+            delivery_payload["dashboardContent"],
+        )
+        self.assertEqual(
+            contract_payload["renderingGuidance"],
+            delivery_payload["renderingGuidance"],
+        )
+
+    def test_optional_content_preserves_contract_identity_and_governance(self):
+        publication = published_contract_instance(delivery_result_with_content())
+        payload = publication.contract_instance.to_dict()
+
+        self.assertEqual(
+            payload["deliveryMetadata"]["deliveryContractVersion"],
+            WEBSITE_PROJECTION_DELIVERY_CONTRACT_VERSION,
+        )
+        self.assertEqual(
+            payload["deliveryMetadata"]["publicationPolicyVersion"],
+            WEBSITE_PROJECTION_DELIVERY_PUBLICATION_POLICY_VERSION,
+        )
+        self.assertEqual(
+            payload["eligibility"]["compatibilityState"],
+            "compatible",
+        )
+        self.assertEqual(
+            payload["compatibility"]["deliveryContractCompatibility"],
+            "compatible",
+        )
+        self.assertEqual(
+            payload["limitations"]["limitationVisibilityState"],
+            "visible",
+        )
+        self.assertIn(
+            {
+                "fieldGroup": "dashboardContent",
+                "classification": "restricted_assessment",
+            },
+            payload["classification"]["fieldClassifications"],
+        )
+
+    def test_optional_content_models_are_immutable(self):
+        dashboard_content = approved_dashboard_content()
+        rendering_guidance = approved_rendering_guidance()
+
+        with self.assertRaises(FrozenInstanceError):
+            dashboard_content.sections = ()
+
+        with self.assertRaises(FrozenInstanceError):
+            dashboard_content.sections[0][1].items[0].label = "changed"
+
+        with self.assertRaises(FrozenInstanceError):
+            rendering_guidance.section_order = ("metrics",)
+
+    def test_optional_content_serialization_is_deterministic(self):
+        publication = published_contract_instance(delivery_result_with_content())
+
+        first = publication.contract_instance.serialize()
+        second = publication.contract_instance.serialize()
+
+        self.assertEqual(first, second)
+        self.assertEqual(json.loads(first), publication.contract_instance.to_dict())
+
+    def test_optional_content_publication_is_stable_repeatedly(self):
+        source_delivery_result = delivery_result_with_content()
+        publisher = WebsiteProjectionDeliveryContractPublisher()
+
+        first = publisher.publish(source_delivery_result)
+        second = publisher.publish(source_delivery_result)
+
+        self.assertEqual(first, second)
+        self.assertEqual(
+            first.contract_instance.serialize(),
+            second.contract_instance.serialize(),
+        )
+
+    def test_dashboard_content_requires_approved_classification(self):
+        result = delivery_result(
+            WebsiteProjectionDeliveryRequest(
+                dashboard_content=approved_dashboard_content(),
+            )
+        )
+
+        self.assertFalse(result.delivered)
+        self.assertIsNone(result.delivery)
+        self.assertEqual(issue_codes(result), ("classification-not-approved",))
+
+    def test_rendering_guidance_requires_approved_classification(self):
+        result = delivery_result(
+            WebsiteProjectionDeliveryRequest(
+                rendering_guidance=approved_rendering_guidance(),
+            )
+        )
+
+        self.assertFalse(result.delivered)
+        self.assertIsNone(result.delivery)
+        self.assertEqual(issue_codes(result), ("classification-not-approved",))
+
+    def test_malformed_dashboard_content_fails_closed(self):
+        result = delivery_result(
+            WebsiteProjectionDeliveryRequest(
+                field_classifications=APPROVED_FIELD_CLASSIFICATIONS,
+                dashboard_content=WebsiteProjectionDashboardContent(
+                    sections=()
+                ),
+            )
+        )
+
+        self.assertFalse(result.delivered)
+        self.assertIsNone(result.delivery)
+        self.assertEqual(issue_codes(result), ("delivery-payload-malformed",))
+
+    def test_malformed_rendering_guidance_fails_closed(self):
+        result = delivery_result(
+            WebsiteProjectionDeliveryRequest(
+                field_classifications=APPROVED_FIELD_CLASSIFICATIONS,
+                rendering_guidance=WebsiteProjectionRenderingGuidance(
+                    section_order=("summaries", "summaries"),
+                ),
+            )
+        )
+
+        self.assertFalse(result.delivered)
+        self.assertIsNone(result.delivery)
+        self.assertEqual(issue_codes(result), ("delivery-payload-malformed",))
+
+    def test_optional_content_does_not_generate_business_semantics(self):
+        payload = delivery_result().delivery.to_dict()
+
+        generated_content_keys = (
+            "dashboardContent",
+            "renderingGuidance",
+            "readiness",
+            "confidence",
+            "recommendations",
+            "priorities",
+            "narrative",
+        )
+        for key in generated_content_keys:
+            self.assertFalse(contains_key(payload, key), key)
 
 
 if __name__ == "__main__":

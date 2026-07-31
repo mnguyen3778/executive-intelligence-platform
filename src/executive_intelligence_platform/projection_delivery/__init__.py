@@ -18,8 +18,13 @@ from .delivery import (
     WebsiteProjectionDeliveryRequest,
     WebsiteProjectionDeliveryResult,
     WebsiteProjectionDeliveryVersionContext,
+    WebsiteProjectionContentItem,
+    WebsiteProjectionContentSection,
+    WebsiteProjectionDashboardContent,
+    WebsiteProjectionDisplayField,
     WebsiteProjectionLimitations,
     WebsiteProjectionPublication,
+    WebsiteProjectionRenderingGuidance,
 )
 
 __all__ = [
@@ -40,6 +45,11 @@ __all__ = [
     "WebsiteProjectionDeliveryRequest",
     "WebsiteProjectionDeliveryResult",
     "WebsiteProjectionDeliveryVersionContext",
+    "WebsiteProjectionContentItem",
+    "WebsiteProjectionContentSection",
+    "WebsiteProjectionDashboardContent",
+    "WebsiteProjectionDisplayField",
     "WebsiteProjectionLimitations",
     "WebsiteProjectionPublication",
+    "WebsiteProjectionRenderingGuidance",
 ]
