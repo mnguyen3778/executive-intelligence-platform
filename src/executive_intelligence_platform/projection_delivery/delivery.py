@@ -8,6 +8,7 @@ assemble packages, create projections, or implement Website behavior.
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Any
@@ -508,6 +509,48 @@ class WebsiteProjectionDeliveryResult:
         }
 
 
+@dataclass(frozen=True)
+class WebsiteProjectionDeliveryContractInstance:
+    delivery: WebsiteProjectionDelivery
+
+    @property
+    def delivery_contract_version(self) -> str:
+        return self.delivery.delivery_metadata.delivery_contract_version
+
+    @property
+    def publication_policy_version(self) -> str:
+        return self.delivery.delivery_metadata.publication_policy_version
+
+    def to_dict(self) -> dict[str, Any]:
+        return self.delivery.to_dict()
+
+    def serialize(self) -> str:
+        return json.dumps(
+            self.to_dict(),
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+
+
+@dataclass(frozen=True)
+class WebsiteProjectionDeliveryContractPublicationResult:
+    published: bool
+    contract_instance: WebsiteProjectionDeliveryContractInstance | None
+    issues: tuple[WebsiteProjectionDeliveryIssue, ...]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "published": self.published,
+            "contractInstance": (
+                self.contract_instance.to_dict()
+                if self.contract_instance is not None
+                else None
+            ),
+            "issues": [issue.to_dict() for issue in self.issues],
+        }
+
+
 class WebsiteProjectionDeliveryPublisher:
     """Deterministic publisher for Website-facing projection delivery."""
 
@@ -553,6 +596,50 @@ class WebsiteProjectionDeliveryPublisher:
             )
 
         return _result(True, delivery, [])
+
+
+class WebsiteProjectionDeliveryContractPublisher:
+    """Publishes immutable Website delivery contract instances."""
+
+    def publish(
+        self,
+        delivery_result: object,
+    ) -> WebsiteProjectionDeliveryContractPublicationResult:
+        if not isinstance(delivery_result, WebsiteProjectionDeliveryResult):
+            return _publication_result(
+                False,
+                None,
+                [
+                    _issue(
+                        "delivery-payload-malformed",
+                        "$.deliveryResult",
+                        (
+                            "Publication requires a "
+                            "WebsiteProjectionDeliveryResult."
+                        ),
+                    )
+                ],
+            )
+
+        if not delivery_result.delivered or delivery_result.delivery is None:
+            issues = list(delivery_result.issues)
+            if not issues:
+                issues.append(
+                    _issue(
+                        "publication-policy-violation",
+                        "$.deliveryResult",
+                        "Only successful delivery results may be published.",
+                    )
+                )
+            return _publication_result(False, None, issues)
+
+        return _publication_result(
+            True,
+            WebsiteProjectionDeliveryContractInstance(
+                delivery=delivery_result.delivery,
+            ),
+            [],
+        )
 
 
 def _validate_request(
@@ -1039,5 +1126,17 @@ def _result(
     return WebsiteProjectionDeliveryResult(
         delivered=delivered,
         delivery=delivery,
+        issues=tuple(issues),
+    )
+
+
+def _publication_result(
+    published: bool,
+    contract_instance: WebsiteProjectionDeliveryContractInstance | None,
+    issues: list[WebsiteProjectionDeliveryIssue],
+) -> WebsiteProjectionDeliveryContractPublicationResult:
+    return WebsiteProjectionDeliveryContractPublicationResult(
+        published=published,
+        contract_instance=contract_instance,
         issues=tuple(issues),
     )

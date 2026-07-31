@@ -1,3 +1,4 @@
+import json
 import sys
 import unittest
 from dataclasses import FrozenInstanceError
@@ -25,6 +26,7 @@ from executive_intelligence_platform.projection_delivery import (  # noqa: E402
     WEBSITE_PROJECTION_DELIVERY_CONTRACT_VERSION,
     WEBSITE_PROJECTION_DELIVERY_FAILURE_REASON_CODES,
     WEBSITE_PROJECTION_DELIVERY_PUBLICATION_POLICY_VERSION,
+    WebsiteProjectionDeliveryContractPublisher,
     WebsiteProjectionDeliveryPublisher,
     WebsiteProjectionDeliveryRequest,
 )
@@ -140,6 +142,12 @@ def delivery_result(request=None, projection=None):
     return WebsiteProjectionDeliveryPublisher().publish(
         WebsiteProjectionDeliveryRequest() if request is None else request,
         executive_projection() if projection is None else projection,
+    )
+
+
+def published_contract_instance(delivery=None):
+    return WebsiteProjectionDeliveryContractPublisher().publish(
+        delivery_result() if delivery is None else delivery
     )
 
 
@@ -555,6 +563,194 @@ class WebsiteProjectionDeliveryTests(unittest.TestCase):
         )
         for key in business_truth_keys:
             self.assertFalse(contains_key(delivery, key), key)
+
+    def test_publishes_delivery_contract_instance_deterministically(self):
+        source_delivery_result = delivery_result()
+
+        first = WebsiteProjectionDeliveryContractPublisher().publish(
+            source_delivery_result
+        )
+        second = WebsiteProjectionDeliveryContractPublisher().publish(
+            source_delivery_result
+        )
+
+        self.assertTrue(first.published)
+        self.assertEqual(first.issues, ())
+        self.assertEqual(first, second)
+        self.assertEqual(first.to_dict(), second.to_dict())
+
+    def test_published_contract_instance_preserves_contract_identity(self):
+        source_delivery_result = delivery_result()
+
+        publication = published_contract_instance(source_delivery_result)
+
+        self.assertEqual(
+            publication.contract_instance.delivery_contract_version,
+            WEBSITE_PROJECTION_DELIVERY_CONTRACT_VERSION,
+        )
+        self.assertEqual(
+            publication.contract_instance.publication_policy_version,
+            WEBSITE_PROJECTION_DELIVERY_PUBLICATION_POLICY_VERSION,
+        )
+        self.assertEqual(
+            publication.contract_instance.to_dict(),
+            source_delivery_result.delivery.to_dict(),
+        )
+
+    def test_published_contract_instance_preserves_lineage_versions_and_metadata(
+        self,
+    ):
+        source_delivery_result = delivery_result()
+
+        publication = published_contract_instance(source_delivery_result)
+        contract_payload = publication.contract_instance.to_dict()
+        delivery_payload = source_delivery_result.delivery.to_dict()
+
+        self.assertEqual(
+            contract_payload["lineage"],
+            delivery_payload["lineage"],
+        )
+        self.assertEqual(
+            contract_payload["versionContext"],
+            delivery_payload["versionContext"],
+        )
+        self.assertEqual(
+            contract_payload["deliveryMetadata"],
+            delivery_payload["deliveryMetadata"],
+        )
+        self.assertEqual(
+            contract_payload["publication"],
+            delivery_payload["publication"],
+        )
+
+    def test_published_contract_instance_preserves_governance_indicators(self):
+        source_delivery_result = delivery_result()
+
+        publication = published_contract_instance(source_delivery_result)
+        contract_payload = publication.contract_instance.to_dict()
+        delivery_payload = source_delivery_result.delivery.to_dict()
+
+        self.assertEqual(
+            contract_payload["eligibility"],
+            delivery_payload["eligibility"],
+        )
+        self.assertEqual(
+            contract_payload["compatibility"],
+            delivery_payload["compatibility"],
+        )
+        self.assertEqual(
+            contract_payload["classification"],
+            delivery_payload["classification"],
+        )
+        self.assertEqual(
+            contract_payload["limitations"],
+            delivery_payload["limitations"],
+        )
+
+    def test_published_contract_instance_is_immutable(self):
+        publication = published_contract_instance()
+
+        with self.assertRaises(FrozenInstanceError):
+            publication.published = False
+
+        with self.assertRaises(FrozenInstanceError):
+            publication.contract_instance.delivery = None
+
+        with self.assertRaises(FrozenInstanceError):
+            publication.contract_instance.delivery.lineage.assessment_version = (
+                "changed"
+            )
+
+    def test_contract_instance_serialization_is_deterministic(self):
+        publication = published_contract_instance()
+
+        first = publication.contract_instance.serialize()
+        second = publication.contract_instance.serialize()
+
+        self.assertEqual(first, second)
+        self.assertEqual(json.loads(first), publication.contract_instance.to_dict())
+        self.assertEqual(
+            first,
+            json.dumps(
+                publication.contract_instance.to_dict(),
+                ensure_ascii=True,
+                separators=(",", ":"),
+                sort_keys=True,
+            ),
+        )
+
+    def test_contract_publication_preserves_delivery_result_immutability(self):
+        source_delivery_result = delivery_result()
+        before = source_delivery_result.to_dict()
+
+        WebsiteProjectionDeliveryContractPublisher().publish(
+            source_delivery_result
+        )
+
+        self.assertEqual(source_delivery_result.to_dict(), before)
+
+    def test_contract_publication_excludes_prohibited_upstream_artifacts(self):
+        publication = published_contract_instance()
+        contract_payload = publication.contract_instance.to_dict()
+
+        prohibited_keys = (
+            "businessDecisionPackage",
+            "sourcePackage",
+            "sourceDerivedArtifact",
+            "snapshotEvidence",
+            "catalogEntry",
+            "derivedArtifact",
+            "decisionEvaluation",
+            "businessReadinessSnapshot",
+            "confidenceEvaluation",
+            "recommendationPriorityEvaluation",
+            "executiveSummaryFoundation",
+            "rawEvidence",
+            "credentials",
+            "secrets",
+            "tokens",
+            "stackTrace",
+            "dashboardState",
+        )
+        for key in prohibited_keys:
+            self.assertFalse(contains_key(contract_payload, key), key)
+
+    def test_contract_publication_fails_closed_for_unsuccessful_delivery(self):
+        unsuccessful_delivery = delivery_result(
+            WebsiteProjectionDeliveryRequest(publication_state="draft")
+        )
+
+        publication = WebsiteProjectionDeliveryContractPublisher().publish(
+            unsuccessful_delivery
+        )
+
+        self.assertFalse(publication.published)
+        self.assertIsNone(publication.contract_instance)
+        self.assertEqual(
+            issue_codes(publication),
+            ("publication-state-not-published",),
+        )
+
+    def test_contract_publication_fails_closed_for_invalid_input(self):
+        publication = WebsiteProjectionDeliveryContractPublisher().publish(
+            valid_snapshot()
+        )
+
+        self.assertFalse(publication.published)
+        self.assertIsNone(publication.contract_instance)
+        self.assertEqual(issue_codes(publication), ("delivery-payload-malformed",))
+
+    def test_repeated_contract_publication_serialization_is_stable(self):
+        source_delivery_result = delivery_result()
+        publisher = WebsiteProjectionDeliveryContractPublisher()
+
+        first = publisher.publish(source_delivery_result)
+        second = publisher.publish(source_delivery_result)
+
+        self.assertEqual(
+            first.contract_instance.serialize(),
+            second.contract_instance.serialize(),
+        )
 
 
 if __name__ == "__main__":
