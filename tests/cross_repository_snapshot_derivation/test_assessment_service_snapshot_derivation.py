@@ -2,6 +2,7 @@ import copy
 import sys
 import unittest
 from pathlib import Path
+from dataclasses import FrozenInstanceError, replace
 from types import MappingProxyType
 
 
@@ -14,6 +15,7 @@ sys.path.insert(0, str(ASSESSMENT_SERVICE_ROOT / "src"))
 from assessment.business_decision_package import (  # noqa: E402
     BUSINESS_DECISION_PACKAGE_COMPONENT_VERSIONS,
     BUSINESS_DECISION_PACKAGE_CONTRACT_VERSION,
+    GOVERNED_BUSINESS_DECISION_PACKAGE_CONTRACT_VERSION,
 )
 from assessment.executive_orchestration import (  # noqa: E402
     ValidatedCanonicalExecutiveAssessmentInput,
@@ -30,6 +32,8 @@ from assessment.methodology_config import (  # noqa: E402
     BUSINESS_DECISION_METHODOLOGY,
     METHODOLOGY_VERSION,
 )
+sys.path.insert(0, str(ASSESSMENT_SERVICE_ROOT / "tests"))
+from test_golden_fixture_regression import request as golden_fixture_request  # noqa: E402
 from executive_intelligence_platform.snapshot_catalog import (  # noqa: E402
     SNAPSHOT_CATALOG_ADMISSION_POLICY_VERSION,
     SnapshotAdmissionMetadata,
@@ -41,6 +45,9 @@ from executive_intelligence_platform.snapshot_derivation import (  # noqa: E402
     SNAPSHOT_DERIVATION_RUNTIME_VERSION,
     SnapshotDerivationRequest,
     SnapshotDerivationRuntime,
+)
+from executive_intelligence_platform.snapshot_derivation.derivation import (  # noqa: E402
+    GOVERNED_CONTENT_DERIVATION_RULE_VERSION,
 )
 
 
@@ -78,6 +85,30 @@ def producer_serialized_snapshot():
             f"{production_result.failure}."
         )
     return production_result.serialized_snapshot
+
+
+def governed_fixture_snapshot():
+    production_result = produce_executive_assessment_snapshot(
+        golden_fixture_request(75, "mixed-strong", "two-high")
+    )
+    if not production_result.is_success:
+        raise AssertionError(production_result.failure)
+    return production_result.serialized_snapshot
+
+
+def admitted_governed_fixture():
+    snapshot = governed_fixture_snapshot()
+    catalog = SnapshotCatalog()
+    admission = catalog.admit(
+        snapshot, producer_snapshot_identity="fixture-v1-high-concentration-risk",
+    )
+    if not admission.accepted:
+        raise AssertionError(admission.issues)
+    return snapshot, catalog, admission.entry
+
+
+def governed_request():
+    return SnapshotDerivationRequest(GOVERNED_CONTENT_DERIVATION_RULE_VERSION)
 
 
 def admit_producer_snapshot(serialized_snapshot=None):
@@ -140,6 +171,137 @@ def unadmitted_mutable_catalog_entry(serialized_snapshot):
 
 
 class CrossRepositorySnapshotDerivationContractTests(unittest.TestCase):
+    def test_frozen_v2_fixture_derives_all_governed_conclusions_verbatim(self):
+        snapshot, catalog, entry = admitted_governed_fixture()
+        before = copy.deepcopy(snapshot)
+        evidence_before = entry.to_dict()["snapshotEvidence"]
+        result = SnapshotDerivationRuntime().derive(entry, governed_request())
+
+        self.assertTrue(result.derived, result.issues)
+        self.assertEqual(result.issues, ())
+        artifact = result.artifact
+        governed = snapshot["businessDecisionPackage"]["governedConclusions"]
+        serialized = artifact.to_dict()["governedConclusions"]
+        self.assertEqual(serialized, governed)
+        self.assertEqual(tuple(serialized), (
+            "severityAssignedFindings", "assessmentRisk", "confidence",
+            "recommendations", "executiveSummary",
+        ))
+        findings = serialized["severityAssignedFindings"]
+        self.assertEqual(len(findings), 2)
+        self.assertEqual(
+            [(item["findingId"], item["severityClassification"],
+              item["sourceReferences"], item["sequenceIdentifier"])
+             for item in findings],
+            [(item["findingId"], item["severityClassification"],
+              item["sourceReferences"], item["sequenceIdentifier"])
+             for item in governed["severityAssignedFindings"]],
+        )
+        for group in ("assessmentRisk", "confidence", "recommendations"):
+            self.assertEqual(serialized[group], governed[group])
+        self.assertEqual(serialized["executiveSummary"], governed["executiveSummary"])
+        self.assertEqual(len(serialized["executiveSummary"]["sectionText"]), 7)
+        self.assertEqual(
+            list(serialized["executiveSummary"]["sectionText"]),
+            list(governed["executiveSummary"]["sectionText"]),
+        )
+        self.assertEqual(artifact.derivation_rule_version,
+                         GOVERNED_CONTENT_DERIVATION_RULE_VERSION)
+        self.assertEqual(artifact.snapshot_contract_version,
+                         EXECUTIVE_RUNTIME_RESPONSE_CONTRACT_VERSION)
+        self.assertEqual(artifact.catalog_admission_metadata.package_contract_version,
+                         GOVERNED_BUSINESS_DECISION_PACKAGE_CONTRACT_VERSION)
+        self.assertEqual(artifact.assessment_version,
+                         snapshot["businessDecisionPackage"]["versionMetadata"]["assessmentVersion"])
+        self.assertEqual(artifact.methodology_version, METHODOLOGY_VERSION)
+        self.assertEqual(artifact.producer_provenance.source_component_ids,
+                         tuple(snapshot["businessDecisionPackage"]["audit"]["sourceComponentIds"]))
+        self.assertEqual(artifact.producer_provenance.production_authority,
+                         NOT_PRODUCTION_AUTHORITATIVE)
+        self.assertEqual(snapshot, before)
+        self.assertEqual(entry.to_dict()["snapshotEvidence"], evidence_before)
+        self.assertIs(catalog.get("fixture-v1-high-concentration-risk"), entry)
+
+    def test_governed_derivation_is_deterministic_and_deeply_immutable(self):
+        snapshot, _catalog, entry = admitted_governed_fixture()
+        runtime = SnapshotDerivationRuntime()
+        first = runtime.derive(entry, governed_request())
+        second = runtime.derive(entry, governed_request())
+        self.assertEqual(first.to_dict(), second.to_dict())
+        self.assertEqual(first.artifact, second.artifact)
+        with self.assertRaises(FrozenInstanceError):
+            first.artifact.governed_conclusions = None
+        with self.assertRaises(TypeError):
+            first.artifact.governed_conclusions["assessmentRisk"] = {}
+        with self.assertRaises(TypeError):
+            first.artifact.governed_conclusions["severityAssignedFindings"][0]["findingId"] = "changed"
+        output = first.artifact.to_dict()
+        output["governedConclusions"]["severityAssignedFindings"][0]["sourceReferences"].clear()
+        snapshot["businessDecisionPackage"]["governedConclusions"]["severityAssignedFindings"][0]["title"] = "changed"
+        self.assertEqual(first.artifact.to_dict(), second.artifact.to_dict())
+        self.assertNotEqual(
+            first.artifact.to_dict()["governedConclusions"],
+            snapshot["businessDecisionPackage"]["governedConclusions"],
+        )
+
+    def test_legacy_rule_remains_lineage_only_for_admitted_v2(self):
+        _snapshot, _catalog, entry = admitted_governed_fixture()
+        result = SnapshotDerivationRuntime().derive(entry, SnapshotDerivationRequest())
+        self.assertTrue(result.derived)
+        self.assertIsNone(result.artifact.governed_conclusions)
+        self.assertNotIn("governedConclusions", result.artifact.to_dict())
+
+    def test_governed_derivation_rejects_tampered_evidence_and_provenance(self):
+        changes = (
+            ("missing conclusions", lambda s: s["businessDecisionPackage"].pop("governedConclusions"),
+             "invalid-governed-snapshot-evidence"),
+            ("malformed conclusions", lambda s: s["businessDecisionPackage"]
+             ["governedConclusions"].__setitem__("confidence", {}),
+             "invalid-governed-snapshot-evidence"),
+            ("missing references", lambda s: s["businessDecisionPackage"]
+             ["governedConclusions"]["severityAssignedFindings"][0]
+             .__setitem__("sourceReferences", []), "invalid-governed-snapshot-evidence"),
+            ("unsupported package", lambda s: s["businessDecisionPackage"]
+             ["versionMetadata"].__setitem__("contractVersion", "business-decision-package-v3"),
+             "invalid-governed-snapshot-evidence"),
+            ("unsupported assessment", lambda s: s["businessDecisionPackage"]
+             ["versionMetadata"].__setitem__("assessmentVersion", "unsupported"),
+             "invalid-governed-snapshot-evidence"),
+            ("invalid authority", lambda s: s["responseStatus"]
+             .__setitem__("productionAuthority", "UPGRADED"),
+             "invalid-governed-snapshot-evidence"),
+        )
+        runtime = SnapshotDerivationRuntime()
+        for name, change, expected in changes:
+            with self.subTest(name=name):
+                _snapshot, _catalog, entry = admitted_governed_fixture()
+                evidence = entry.to_dict()["snapshotEvidence"]
+                change(evidence)
+                forged = replace(entry, snapshot_evidence=MappingProxyType(evidence))
+                result = runtime.derive(forged, governed_request())
+                self.assertFalse(result.derived)
+                self.assertIsNone(result.artifact)
+                self.assertIn(expected, issue_codes(result))
+
+        _snapshot, _catalog, entry = admitted_governed_fixture()
+        for name, metadata in (
+            ("assessment binding", replace(entry.admission_metadata,
+              assessment_version=EXECUTIVE_ASSESSMENT_VERSION)),
+            ("source provenance", replace(entry.admission_metadata,
+              source_component_ids=("decisionEvaluation",))),
+            ("production authority", replace(entry.admission_metadata,
+              production_authority="PRODUCTION_AUTHORITY_UPGRADED")),
+        ):
+            with self.subTest(name=name):
+                result = runtime.derive(replace(entry, admission_metadata=metadata),
+                                        governed_request())
+                self.assertFalse(result.derived)
+                self.assertIsNone(result.artifact)
+                self.assertIn(
+                    "unsupported-governed-version" if name == "assessment binding"
+                    else "inconsistent-catalog-provenance", issue_codes(result),
+                )
+
     def test_admitted_assessment_service_snapshot_derives_successfully(self):
         serialized_snapshot, _catalog, admission_result = admit_producer_snapshot()
         runtime = SnapshotDerivationRuntime()

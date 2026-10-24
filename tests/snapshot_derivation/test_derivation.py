@@ -1,7 +1,7 @@
 import copy
 import sys
 import unittest
-from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError, replace
 from pathlib import Path
 
 
@@ -18,6 +18,9 @@ from executive_intelligence_platform.snapshot_derivation import (  # noqa: E402
     SNAPSHOT_DERIVATION_RUNTIME_VERSION,
     SnapshotDerivationRequest,
     SnapshotDerivationRuntime,
+)
+from executive_intelligence_platform.snapshot_derivation.derivation import (  # noqa: E402
+    GOVERNED_CONTENT_DERIVATION_RULE_VERSION,
 )
 
 
@@ -133,6 +136,28 @@ class SnapshotDerivationRuntimeTests(unittest.TestCase):
             result.artifact.derivation_runtime_version,
             SNAPSHOT_DERIVATION_RUNTIME_VERSION,
         )
+        self.assertIsNone(result.artifact.governed_conclusions)
+        self.assertNotIn("governedConclusions", result.artifact.to_dict())
+
+    def test_v1_snapshot_cannot_use_governed_content_rule(self):
+        result = SnapshotDerivationRuntime().derive(
+            admitted_entry(),
+            SnapshotDerivationRequest(GOVERNED_CONTENT_DERIVATION_RULE_VERSION),
+        )
+
+        self.assertFalse(result.derived)
+        self.assertIsNone(result.artifact)
+        self.assertEqual(issue_codes(result), ("unsupported-governed-version",))
+
+    def test_artifact_rejects_content_under_legacy_rule(self):
+        artifact = SnapshotDerivationRuntime().derive(
+            admitted_entry(), SnapshotDerivationRequest(),
+        ).artifact
+        with self.assertRaises(ValueError):
+            replace(artifact, governed_conclusions={"assessmentRisk": {}})
+        with self.assertRaises(ValueError):
+            replace(artifact,
+                    derivation_rule_version=GOVERNED_CONTENT_DERIVATION_RULE_VERSION)
 
     def test_rejects_raw_snapshot(self):
         runtime = SnapshotDerivationRuntime()

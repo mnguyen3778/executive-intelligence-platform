@@ -1,24 +1,41 @@
 """Deterministic derivation runtime for admitted snapshot catalog entries.
 
-The runtime consumes only SnapshotCatalogEntry instances. It produces
-platform-owned lineage artifacts without modifying catalog entries, inspecting
-assessment content for conclusions, or recomputing Assessment Service outputs.
+The runtime consumes only SnapshotCatalogEntry instances. The legacy rule
+produces lineage-only artifacts; the governed rule preserves producer-owned
+conclusions without modifying catalog entries or recomputing assessment truth.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from types import MappingProxyType
-from typing import Any
+from typing import Any, Mapping
 
 from executive_intelligence_platform.snapshot_catalog import (
     SnapshotAdmissionMetadata,
     SnapshotCatalogEntry,
 )
+from executive_intelligence_platform.snapshot_compatibility import (
+    validate_snapshot_compatibility,
+)
 
 
 SNAPSHOT_DERIVATION_RULE_VERSION = "snapshot-derivation-lineage-artifact-v1"
+GOVERNED_CONTENT_DERIVATION_RULE_VERSION = (
+    "snapshot-derivation-governed-content-v2"
+)
 SNAPSHOT_DERIVATION_RUNTIME_VERSION = "snapshot-derivation-runtime-v1"
+GOVERNED_PACKAGE_VERSION = "business-decision-package-v2"
+GOVERNED_ASSESSMENT_VERSION = "nguyen-ai-executive-assessment-v2"
+GOVERNED_METHODOLOGY_VERSION = "business-decision-methodology-v1"
+GOVERNED_RESPONSE_VERSION = "executive-runtime-response-v1"
+GOVERNED_CONCLUSION_FIELDS = (
+    "severityAssignedFindings",
+    "assessmentRisk",
+    "confidence",
+    "recommendations",
+    "executiveSummary",
+)
 SNAPSHOT_DERIVATION_ISSUE_CODES = MappingProxyType(
     {
         "invalid-catalog-entry": (
@@ -35,6 +52,15 @@ SNAPSHOT_DERIVATION_ISSUE_CODES = MappingProxyType(
         ),
         "missing-snapshot-evidence": (
             "Catalog entry does not contain preserved snapshot evidence."
+        ),
+        "invalid-governed-snapshot-evidence": (
+            "Catalog snapshot evidence is not a compatible governed v2 snapshot."
+        ),
+        "unsupported-governed-version": (
+            "Catalog entry does not have the frozen governed v2 version binding."
+        ),
+        "inconsistent-catalog-provenance": (
+            "Catalog admission metadata conflicts with preserved snapshot evidence."
         ),
     }
 )
@@ -103,9 +129,25 @@ class SnapshotDerivedArtifact:
     producer_provenance: SnapshotProducerProvenance
     derivation_rule_version: str
     derivation_runtime_version: str
+    governed_conclusions: Mapping[str, Any] | None = None
+
+    def __post_init__(self) -> None:
+        governed_rule = (
+            self.derivation_rule_version == GOVERNED_CONTENT_DERIVATION_RULE_VERSION
+        )
+        if governed_rule != (self.governed_conclusions is not None):
+            raise ValueError(
+                "Governed conclusions require the governed-content derivation rule."
+            )
+        if self.governed_conclusions is not None:
+            object.__setattr__(
+                self,
+                "governed_conclusions",
+                _freeze(_thaw(self.governed_conclusions)),
+            )
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        artifact = {
             "producerSnapshotIdentity": self.producer_snapshot_identity,
             "snapshotContractVersion": self.snapshot_contract_version,
             "assessmentVersion": self.assessment_version,
@@ -120,6 +162,9 @@ class SnapshotDerivedArtifact:
             "derivationRuleVersion": self.derivation_rule_version,
             "derivationRuntimeVersion": self.derivation_runtime_version,
         }
+        if self.governed_conclusions is not None:
+            artifact["governedConclusions"] = _thaw(self.governed_conclusions)
+        return artifact
 
 
 @dataclass(frozen=True)
@@ -154,7 +199,10 @@ class SnapshotDerivationRuntime:
                     "Derivation request must be a SnapshotDerivationRequest.",
                 )
             )
-        elif request.derivation_rule_version != SNAPSHOT_DERIVATION_RULE_VERSION:
+        elif request.derivation_rule_version not in (
+            SNAPSHOT_DERIVATION_RULE_VERSION,
+            GOVERNED_CONTENT_DERIVATION_RULE_VERSION,
+        ):
             issues.append(
                 _issue(
                     "unsupported-derivation-rule",
@@ -174,6 +222,12 @@ class SnapshotDerivationRuntime:
             return _result(False, None, issues)
 
         issues.extend(_validate_catalog_entry(catalog_entry))
+        if (
+            isinstance(request, SnapshotDerivationRequest)
+            and request.derivation_rule_version == GOVERNED_CONTENT_DERIVATION_RULE_VERSION
+            and not issues
+        ):
+            issues.extend(_validate_governed_catalog_entry(catalog_entry))
         if issues:
             return _result(False, None, issues)
 
@@ -244,6 +298,12 @@ def _derive_artifact(
         production_authority=metadata.production_authority,
     )
 
+    governed_conclusions = None
+    if request.derivation_rule_version == GOVERNED_CONTENT_DERIVATION_RULE_VERSION:
+        governed_conclusions = catalog_entry.snapshot_evidence[
+            "businessDecisionPackage"
+        ]["governedConclusions"]
+
     return SnapshotDerivedArtifact(
         producer_snapshot_identity=metadata.producer_snapshot_identity,
         snapshot_contract_version=metadata.response_contract_version,
@@ -254,7 +314,94 @@ def _derive_artifact(
         producer_provenance=producer_provenance,
         derivation_rule_version=request.derivation_rule_version,
         derivation_runtime_version=SNAPSHOT_DERIVATION_RUNTIME_VERSION,
+        governed_conclusions=governed_conclusions,
     )
+
+
+def _validate_governed_catalog_entry(
+    catalog_entry: SnapshotCatalogEntry,
+) -> list[SnapshotDerivationIssue]:
+    metadata = catalog_entry.admission_metadata
+    versions = (
+        metadata.response_contract_version,
+        metadata.package_contract_version,
+        metadata.assessment_version,
+        metadata.methodology_version,
+    )
+    expected = (
+        GOVERNED_RESPONSE_VERSION,
+        GOVERNED_PACKAGE_VERSION,
+        GOVERNED_ASSESSMENT_VERSION,
+        GOVERNED_METHODOLOGY_VERSION,
+    )
+    if versions != expected:
+        return [_issue(
+            "unsupported-governed-version",
+            "$.catalogEntry.admissionMetadata",
+            "Governed content derivation requires the frozen v2 version binding.",
+        )]
+
+    try:
+        evidence = _thaw(catalog_entry.snapshot_evidence)
+        compatible = validate_snapshot_compatibility(evidence).is_valid
+    except (TypeError, ValueError, KeyError, AttributeError):
+        compatible = False
+    if not compatible:
+        return [_issue(
+            "invalid-governed-snapshot-evidence",
+            "$.catalogEntry.snapshotEvidence",
+            "Governed content requires complete compatible snapshot evidence.",
+        )]
+
+    package = evidence["businessDecisionPackage"]
+    version_metadata = package["versionMetadata"]
+    audit = package["audit"]
+    status = evidence["responseStatus"]
+    observed = (
+        evidence["responseContractVersion"],
+        version_metadata["contractVersion"],
+        version_metadata["assessmentVersion"],
+        version_metadata["methodologyVersion"],
+        tuple(audit["sourceComponentIds"]),
+        status["productionAuthority"],
+    )
+    admitted = (
+        metadata.response_contract_version,
+        metadata.package_contract_version,
+        metadata.assessment_version,
+        metadata.methodology_version,
+        tuple(metadata.source_component_ids),
+        metadata.production_authority,
+    )
+    if observed != admitted:
+        return [_issue(
+            "inconsistent-catalog-provenance",
+            "$.catalogEntry.admissionMetadata",
+            "Admission metadata does not match the preserved producer snapshot.",
+        )]
+    if tuple(package["governedConclusions"]) != GOVERNED_CONCLUSION_FIELDS:
+        return [_issue(
+            "invalid-governed-snapshot-evidence",
+            "$.catalogEntry.snapshotEvidence.businessDecisionPackage.governedConclusions",
+            "The five producer governed conclusion groups are required in order.",
+        )]
+    return []
+
+
+def _freeze(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return MappingProxyType({key: _freeze(item) for key, item in value.items()})
+    if isinstance(value, (list, tuple)):
+        return tuple(_freeze(item) for item in value)
+    return value
+
+
+def _thaw(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {key: _thaw(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_thaw(item) for item in value]
+    return value
 
 
 def _issue(code: str, path: str, message: str) -> SnapshotDerivationIssue:
