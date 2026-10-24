@@ -15,6 +15,8 @@ from typing import Any, Mapping
 SUPPORTED_RESPONSE_CONTRACT_VERSION = "executive-runtime-response-v1"
 SUPPORTED_PACKAGE_CONTRACT_VERSION = "business-decision-package-v1"
 SUPPORTED_ASSESSMENT_VERSION = "nguyen-ai-executive-assessment-v1"
+GOVERNED_PACKAGE_CONTRACT_VERSION = "business-decision-package-v2"
+GOVERNED_ASSESSMENT_VERSION = "nguyen-ai-executive-assessment-v2"
 SUPPORTED_METHODOLOGY_VERSION = "business-decision-methodology-v1"
 
 ROOT_FIELD_ORDER = (
@@ -38,6 +40,7 @@ PACKAGE_FIELD_ORDER = (
     "limitations",
     "versionMetadata",
 )
+GOVERNED_PACKAGE_FIELD_ORDER = PACKAGE_FIELD_ORDER + ("governedConclusions",)
 PACKAGE_COMPONENT_FIELDS = (
     "decisionEvaluation",
     "businessReadinessSnapshot",
@@ -73,6 +76,33 @@ PACKAGE_LIMITATIONS = (
     "persistence-not-implemented",
     "api-exposure-of-snapshot-consumers-not-implemented",
 )
+GOVERNED_PACKAGE_LIMITATIONS = PACKAGE_LIMITATIONS[4:]
+GOVERNED_CONCLUSION_FIELDS = (
+    "severityAssignedFindings", "assessmentRisk", "confidence",
+    "recommendations", "executiveSummary",
+)
+GOVERNED_FINDING_FIELDS = (
+    "findingId", "title", "primaryDimension", "relatedDimensions",
+    "triggerSource", "findingType", "businessConsequenceBasis",
+    "sourceReferences", "sequenceIdentifier", "severityClassification",
+    "severityDecisionIdentifier", "severityDecisionTableVersion",
+)
+GOVERNED_RECOMMENDATION_FIELDS = (
+    "findingId", "recommendationClassification",
+    "recommendationDecisionIdentifier", "recommendationDecisionTableVersion",
+)
+GOVERNED_SUMMARY_SECTIONS = (
+    "overall-assessment-overview", "business-capability-highlights",
+    "significant-findings", "risk-overview", "confidence-statement",
+    "recommended-actions", "closing-assessment-statement",
+)
+GOVERNED_DIMENSIONS = frozenset(("POC", "GCR", "TISM", "DPSC", "RVCI"))
+GOVERNED_CLASSIFICATIONS = {
+    "severityClassification": frozenset(("critical", "high", "medium", "low", "informational")),
+    "riskClassification": frozenset(("critical-risk", "elevated-risk", "moderate-risk", "low-risk", "minimal-informational")),
+    "confidenceClassification": frozenset(("very-high-confidence", "high-confidence", "moderate-confidence", "low-confidence", "insufficient-confidence")),
+    "recommendationClassification": frozenset(("immediate-action", "priority-action", "planned-improvement", "best-practice", "monitor")),
+}
 RESPONSE_STATUS_ALLOWED_VALUES = {
     "packageValidation": {"VALIDATED"},
     "runtimeEligibility": {"RUNTIME_ELIGIBLE"},
@@ -182,6 +212,9 @@ SNAPSHOT_COMPATIBILITY_ISSUE_CODES = MappingProxyType(
         ),
         "decision-snapshot-total-weight-mismatch": (
             "Readiness snapshot total weight does not match decision evaluation."
+        ),
+        "invalid-governed-conclusions": (
+            "Governed conclusions do not match the frozen producer serialization contract."
         ),
     }
 )
@@ -305,7 +338,8 @@ def _validate_response_status(
     )
 
     for field_name, allowed_values in RESPONSE_STATUS_ALLOWED_VALUES.items():
-        if response_status.get(field_name) not in allowed_values:
+        value = response_status.get(field_name)
+        if not isinstance(value, str) or value not in allowed_values:
             issues.append(
                 _issue(
                     "unsupported-response-status",
@@ -330,9 +364,12 @@ def _validate_business_decision_package(
         )
         return
 
+    metadata = package.get("versionMetadata")
+    governed = isinstance(metadata, Mapping) and metadata.get("contractVersion") == GOVERNED_PACKAGE_CONTRACT_VERSION
+    field_order = GOVERNED_PACKAGE_FIELD_ORDER if governed else PACKAGE_FIELD_ORDER
     _validate_field_order(
         package,
-        PACKAGE_FIELD_ORDER,
+        field_order,
         "$.businessDecisionPackage",
         "package-field-order-mismatch",
         "Serialized package fields do not match contract order.",
@@ -340,7 +377,7 @@ def _validate_business_decision_package(
     )
     _validate_required_and_unexpected_fields(
         package,
-        PACKAGE_FIELD_ORDER,
+        field_order,
         "$.businessDecisionPackage",
         "missing-package-field",
         "unexpected-package-field",
@@ -351,6 +388,8 @@ def _validate_business_decision_package(
     _validate_package_audit(package, issues)
     _validate_package_limitations(package, issues)
     _validate_package_invariants(package, issues)
+    if governed:
+        _validate_governed_conclusions(package.get("governedConclusions"), issues)
 
 
 def _validate_package_component_presence(
@@ -396,7 +435,9 @@ def _validate_package_version_metadata(
         issues,
     )
 
-    if metadata.get("contractVersion") != SUPPORTED_PACKAGE_CONTRACT_VERSION:
+    contract_version = metadata.get("contractVersion")
+    assessment_version = metadata.get("assessmentVersion")
+    if contract_version not in (SUPPORTED_PACKAGE_CONTRACT_VERSION, GOVERNED_PACKAGE_CONTRACT_VERSION):
         issues.append(
             _issue(
                 "unsupported-package-contract-version",
@@ -404,7 +445,11 @@ def _validate_package_version_metadata(
                 "Package contract version is not supported.",
             )
         )
-    if metadata.get("assessmentVersion") != SUPPORTED_ASSESSMENT_VERSION:
+    expected_assessment = (
+        GOVERNED_ASSESSMENT_VERSION if contract_version == GOVERNED_PACKAGE_CONTRACT_VERSION
+        else SUPPORTED_ASSESSMENT_VERSION
+    )
+    if assessment_version != expected_assessment:
         issues.append(
             _issue(
                 "unsupported-assessment-version",
@@ -472,7 +517,8 @@ def _validate_package_audit(
         issues,
     )
 
-    if tuple(audit.get("sourceComponentIds", ())) != PACKAGE_SOURCE_COMPONENTS:
+    source_components = audit.get("sourceComponentIds")
+    if not isinstance(source_components, (list, tuple)) or tuple(source_components) != PACKAGE_SOURCE_COMPONENTS:
         issues.append(
             _issue(
                 "unsupported-source-components",
@@ -516,7 +562,10 @@ def _validate_package_limitations(
         )
         return
 
-    if tuple(limitations) != PACKAGE_LIMITATIONS:
+    metadata = package.get("versionMetadata")
+    governed = isinstance(metadata, Mapping) and metadata.get("contractVersion") == GOVERNED_PACKAGE_CONTRACT_VERSION
+    expected = GOVERNED_PACKAGE_LIMITATIONS if governed else PACKAGE_LIMITATIONS
+    if tuple(limitations) != expected:
         issues.append(
             _issue(
                 "unsupported-package-limitations",
@@ -524,7 +573,7 @@ def _validate_package_limitations(
                 "Package limitations do not match the producer contract.",
             )
         )
-    if len(limitations) != len(set(limitations)):
+    if all(isinstance(item, str) for item in limitations) and len(limitations) != len(set(limitations)):
         issues.append(
             _issue(
                 "duplicate-package-limitations",
@@ -579,6 +628,127 @@ def _validate_package_invariants(
                     "Snapshot total weight does not match decision evaluation.",
                 )
             )
+
+
+def _validate_governed_conclusions(
+    value: object,
+    issues: list[SnapshotCompatibilityIssue],
+) -> None:
+    try:
+        valid = _governed_conclusions_match_contract(value)
+    except (TypeError, ValueError):
+        valid = False
+    if not valid:
+        issues.append(_issue(
+            "invalid-governed-conclusions",
+            "$.businessDecisionPackage.governedConclusions",
+            "Governed conclusions are incomplete, malformed, or out of canonical order.",
+        ))
+
+
+def _ordered_mapping(value: object, fields: tuple[str, ...]) -> bool:
+    return isinstance(value, Mapping) and tuple(value) == fields
+
+
+def _text(value: object) -> bool:
+    return isinstance(value, str) and bool(value.strip())
+
+
+def _canonical_references(value: object, *, required: bool = False) -> bool:
+    return (
+        isinstance(value, list)
+        and (bool(value) or not required)
+        and all(_text(item) for item in value)
+        and value == sorted(set(value))
+    )
+
+
+def _governed_decision(
+    value: object, fields: tuple[str, ...], classification: str,
+    table_version: str,
+) -> bool:
+    return (
+        _ordered_mapping(value, fields)
+        and isinstance(value[classification], str)
+        and value[classification] in GOVERNED_CLASSIFICATIONS[classification]
+        and _text(value[fields[1]])
+        and value[fields[2]] == table_version
+    )
+
+
+def _governed_conclusions_match_contract(value: object) -> bool:
+    if not _ordered_mapping(value, GOVERNED_CONCLUSION_FIELDS):
+        return False
+    findings = value["severityAssignedFindings"]
+    recommendations = value["recommendations"]
+    if not isinstance(findings, list) or not isinstance(recommendations, list):
+        return False
+    finding_ids: list[str] = []
+    for sequence, item in enumerate(findings, 1):
+        if not _ordered_mapping(item, GOVERNED_FINDING_FIELDS):
+            return False
+        if not all(_text(item[key]) for key in (
+            "findingId", "title", "triggerSource", "findingType",
+            "businessConsequenceBasis", "severityDecisionIdentifier",
+        )):
+            return False
+        if item["primaryDimension"] not in GOVERNED_DIMENSIONS:
+            return False
+        if not _canonical_references(item["relatedDimensions"]):
+            return False
+        if any(dimension not in GOVERNED_DIMENSIONS or dimension == item["primaryDimension"]
+               for dimension in item["relatedDimensions"]):
+            return False
+        if not _canonical_references(item["sourceReferences"], required=True):
+            return False
+        if item["triggerSource"] not in item["sourceReferences"]:
+            return False
+        if type(item["sequenceIdentifier"]) is not int or item["sequenceIdentifier"] != sequence:
+            return False
+        if item["severityClassification"] not in GOVERNED_CLASSIFICATIONS["severityClassification"]:
+            return False
+        if item["severityDecisionTableVersion"] != "severity-decision-table-set-v1":
+            return False
+        finding_ids.append(item["findingId"])
+    if finding_ids != sorted(set(finding_ids)):
+        return False
+    if not _governed_decision(
+        value["assessmentRisk"],
+        ("riskClassification", "riskDecisionIdentifier", "riskDecisionTableVersion"),
+        "riskClassification", "risk-decision-table-set-v1",
+    ) or not _governed_decision(
+        value["confidence"],
+        ("confidenceClassification", "confidenceDecisionIdentifier", "confidenceDecisionTableVersion"),
+        "confidenceClassification", "confidence-decision-table-set-v1",
+    ):
+        return False
+    if len(recommendations) != max(1, len(finding_ids)):
+        return False
+    for index, item in enumerate(recommendations):
+        if not _ordered_mapping(item, GOVERNED_RECOMMENDATION_FIELDS):
+            return False
+        if item["findingId"] != (finding_ids[index] if finding_ids else None):
+            return False
+        if (item["recommendationClassification"] not in
+                GOVERNED_CLASSIFICATIONS["recommendationClassification"]):
+            return False
+        if not _text(item["recommendationDecisionIdentifier"]):
+            return False
+        if item["recommendationDecisionTableVersion"] != "recommendation-decision-table-set-v1":
+            return False
+    if not finding_ids and (
+        value["assessmentRisk"]["riskClassification"] != "minimal-informational"
+        or recommendations[0]["recommendationDecisionIdentifier"] != "recommendation-v1-no-findings-monitor"
+    ):
+        return False
+    summary = value["executiveSummary"]
+    return (
+        _ordered_mapping(summary, ("findingCount", "sectionText"))
+        and type(summary["findingCount"]) is int
+        and summary["findingCount"] == len(finding_ids)
+        and _ordered_mapping(summary["sectionText"], GOVERNED_SUMMARY_SECTIONS)
+        and all(_text(text) for text in summary["sectionText"].values())
+    )
 
 
 def _validate_field_order(

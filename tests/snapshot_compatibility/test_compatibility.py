@@ -169,7 +169,7 @@ class SnapshotCompatibilityTests(unittest.TestCase):
     def test_rejects_unsupported_package_contract_version(self):
         snapshot = valid_snapshot()
         snapshot["businessDecisionPackage"]["versionMetadata"]["contractVersion"] = (
-            "business-decision-package-v2"
+            "business-decision-package-v3"
         )
 
         result = validate_snapshot_compatibility(snapshot)
