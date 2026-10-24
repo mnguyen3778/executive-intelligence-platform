@@ -1,7 +1,9 @@
 import copy
 import sys
 import unittest
+from dataclasses import FrozenInstanceError, replace
 from pathlib import Path
+from types import MappingProxyType
 
 
 EIP_ROOT = Path(__file__).resolve().parents[2]
@@ -9,9 +11,11 @@ ASSESSMENT_SERVICE_ROOT = EIP_ROOT.parent / "nguyen-ai-assessment-service"
 
 sys.path.insert(0, str(EIP_ROOT / "src"))
 sys.path.insert(0, str(ASSESSMENT_SERVICE_ROOT / "src"))
+sys.path.insert(0, str(ASSESSMENT_SERVICE_ROOT / "tests"))
 
 from assessment.business_decision_package import (  # noqa: E402
     BUSINESS_DECISION_PACKAGE_CONTRACT_VERSION,
+    GOVERNED_BUSINESS_DECISION_PACKAGE_CONTRACT_VERSION,
 )
 from assessment.executive_orchestration import (  # noqa: E402
     ValidatedCanonicalExecutiveAssessmentInput,
@@ -28,6 +32,7 @@ from assessment.methodology_config import (  # noqa: E402
     BUSINESS_DECISION_METHODOLOGY,
     METHODOLOGY_VERSION,
 )
+from test_golden_fixture_regression import request as golden_fixture_request  # noqa: E402
 from executive_intelligence_platform.executive_intelligence_package import (  # noqa: E402
     EXECUTIVE_INTELLIGENCE_PACKAGE_ASSEMBLY_RULE_VERSION,
     EXECUTIVE_INTELLIGENCE_PACKAGE_CONTRACT_VERSION,
@@ -48,6 +53,9 @@ from executive_intelligence_platform.snapshot_derivation import (  # noqa: E402
     SnapshotDerivationRuntime,
     SnapshotDerivedArtifact,
     SnapshotProducerProvenance,
+)
+from executive_intelligence_platform.snapshot_derivation.derivation import (  # noqa: E402
+    GOVERNED_CONTENT_DERIVATION_RULE_VERSION,
 )
 
 
@@ -85,6 +93,31 @@ def producer_serialized_snapshot():
             f"{production_result.failure}."
         )
     return production_result.serialized_snapshot
+
+
+def governed_fixture_pipeline():
+    production = produce_executive_assessment_snapshot(
+        golden_fixture_request(75, "mixed-strong", "two-high")
+    )
+    if not production.is_success:
+        raise AssertionError(production.failure)
+    snapshot = production.serialized_snapshot
+    catalog = SnapshotCatalog()
+    admission = catalog.admit(
+        snapshot, producer_snapshot_identity="fixture-v1-high-concentration-risk",
+    )
+    if not admission.accepted:
+        raise AssertionError(admission.issues)
+    derived = SnapshotDerivationRuntime().derive(
+        admission.entry,
+        SnapshotDerivationRequest(GOVERNED_CONTENT_DERIVATION_RULE_VERSION),
+    )
+    if not derived.derived:
+        raise AssertionError(derived.issues)
+    packaged = ExecutiveIntelligencePackageAssembler().assemble(
+        ExecutiveIntelligencePackageRequest(), derived.artifact,
+    )
+    return snapshot, admission.entry, derived.artifact, packaged
 
 
 def produce_package_pipeline(serialized_snapshot=None):
@@ -144,6 +177,130 @@ def contains_key(value, key_name):
 
 
 class CrossRepositoryExecutiveIntelligencePackageContractTests(unittest.TestCase):
+    def test_frozen_v2_fixture_reaches_package_with_exact_governed_content(self):
+        snapshot, entry, artifact, packaged = governed_fixture_pipeline()
+        self.assertTrue(packaged.packaged, packaged.issues)
+        self.assertEqual(packaged.issues, ())
+        package = packaged.package
+        self.assertIs(package.source_derived_artifact, artifact)
+        self.assertEqual(package.package_contract_version,
+                         EXECUTIVE_INTELLIGENCE_PACKAGE_CONTRACT_VERSION)
+        self.assertEqual(package.package_assembly_rule_version,
+                         EXECUTIVE_INTELLIGENCE_PACKAGE_ASSEMBLY_RULE_VERSION)
+        serialized = package.to_dict()
+        self.assertNotIn("governedConclusions", serialized)
+        governed = serialized["sourceDerivedArtifact"]["governedConclusions"]
+        producer = snapshot["businessDecisionPackage"]["governedConclusions"]
+        self.assertEqual(governed, producer)
+        self.assertEqual(tuple(governed), (
+            "severityAssignedFindings", "assessmentRisk", "confidence",
+            "recommendations", "executiveSummary",
+        ))
+        self.assertEqual(
+            [(item["findingId"], item["severityClassification"],
+              item["sourceReferences"], item["sequenceIdentifier"])
+             for item in governed["severityAssignedFindings"]],
+            [(item["findingId"], item["severityClassification"],
+              item["sourceReferences"], item["sequenceIdentifier"])
+             for item in producer["severityAssignedFindings"]],
+        )
+        for group in ("assessmentRisk", "confidence", "recommendations"):
+            self.assertEqual(governed[group], producer[group])
+        self.assertEqual(governed["executiveSummary"], producer["executiveSummary"])
+        self.assertEqual(len(governed["executiveSummary"]["sectionText"]), 7)
+        self.assertEqual(list(governed["executiveSummary"]["sectionText"]),
+                         list(producer["executiveSummary"]["sectionText"]))
+        self.assertEqual(package.derivation_rule_version,
+                         GOVERNED_CONTENT_DERIVATION_RULE_VERSION)
+        self.assertEqual(package.snapshot_contract_version,
+                         EXECUTIVE_RUNTIME_RESPONSE_CONTRACT_VERSION)
+        self.assertEqual(package.assessment_version,
+                         snapshot["businessDecisionPackage"]["versionMetadata"]["assessmentVersion"])
+        self.assertEqual(package.methodology_version, METHODOLOGY_VERSION)
+        self.assertEqual(package.lineage.catalog_admission_metadata.package_contract_version,
+                         GOVERNED_BUSINESS_DECISION_PACKAGE_CONTRACT_VERSION)
+        self.assertEqual(package.lineage.producer_provenance.source_component_ids,
+                         tuple(entry.admission_metadata.source_component_ids))
+        self.assertEqual(package.lineage.producer_provenance.production_authority,
+                         NOT_PRODUCTION_AUTHORITATIVE)
+        self.assertEqual(entry.to_dict()["snapshotEvidence"], snapshot)
+
+    def test_governed_package_is_deterministic_and_embedded_content_immutable(self):
+        snapshot, entry, artifact, packaged = governed_fixture_pipeline()
+        assembler = ExecutiveIntelligencePackageAssembler()
+        repeated = assembler.assemble(ExecutiveIntelligencePackageRequest(), artifact)
+        self.assertEqual(packaged.to_dict(), repeated.to_dict())
+        self.assertIs(packaged.package.source_derived_artifact, artifact)
+        with self.assertRaises(FrozenInstanceError):
+            packaged.package.source_derived_artifact = None
+        self.assertIsInstance(artifact.governed_conclusions, MappingProxyType)
+        with self.assertRaises(TypeError):
+            artifact.governed_conclusions["assessmentRisk"]["riskClassification"] = "changed"
+        before = packaged.package.to_dict()
+        output = packaged.package.to_dict()
+        output["sourceDerivedArtifact"]["governedConclusions"]["severityAssignedFindings"][0]["sourceReferences"].clear()
+        snapshot["businessDecisionPackage"]["governedConclusions"]["severityAssignedFindings"][0]["title"] = "changed"
+        self.assertEqual(packaged.package.to_dict(), before)
+        self.assertNotEqual(output, packaged.package.to_dict())
+        self.assertEqual(entry.to_dict()["snapshotEvidence"]["businessDecisionPackage"]
+                         ["governedConclusions"], before["sourceDerivedArtifact"]["governedConclusions"])
+
+    def test_governed_package_rejects_malformed_content_and_bindings(self):
+        _snapshot, _entry, artifact, _packaged = governed_fixture_pipeline()
+        assembler = ExecutiveIntelligencePackageAssembler()
+
+        def changed_conclusions(change):
+            content = copy.deepcopy(artifact.to_dict()["governedConclusions"])
+            change(content)
+            return replace(artifact, governed_conclusions=content)
+
+        missing = replace(artifact)
+        object.__setattr__(missing, "governed_conclusions", None)
+        cases = (
+            ("missing conclusions", missing, "invalid-governed-conclusions"),
+            ("malformed group", changed_conclusions(lambda c: c.__setitem__("confidence", {})),
+             "invalid-governed-conclusions"),
+            ("missing source references", changed_conclusions(lambda c: c["severityAssignedFindings"][0]
+             .__setitem__("sourceReferences", [])), "invalid-governed-conclusions"),
+            ("finding order", changed_conclusions(lambda c: c["severityAssignedFindings"].reverse()),
+             "invalid-governed-conclusions"),
+            ("recommendation order", changed_conclusions(lambda c: c["recommendations"].reverse()),
+             "invalid-governed-conclusions"),
+            ("unsupported package version", replace(artifact,
+             catalog_admission_metadata=replace(artifact.catalog_admission_metadata,
+             package_contract_version="business-decision-package-v3")), "unsupported-governed-version"),
+            ("unsupported assessment", replace(artifact,
+             assessment_version="unsupported-assessment",
+             compatibility_validation_metadata=replace(artifact.compatibility_validation_metadata,
+             assessment_version="unsupported-assessment"),
+             catalog_admission_metadata=replace(artifact.catalog_admission_metadata,
+             assessment_version="unsupported-assessment")), "unsupported-governed-version"),
+            ("unsupported methodology", replace(artifact,
+             methodology_version="unsupported-methodology",
+             compatibility_validation_metadata=replace(artifact.compatibility_validation_metadata,
+             methodology_version="unsupported-methodology"),
+             catalog_admission_metadata=replace(artifact.catalog_admission_metadata,
+             methodology_version="unsupported-methodology")), "unsupported-governed-version"),
+            ("source provenance", replace(artifact,
+             catalog_admission_metadata=replace(artifact.catalog_admission_metadata,
+             source_component_ids=("decisionEvaluation",)),
+             producer_provenance=replace(artifact.producer_provenance,
+             source_component_ids=("decisionEvaluation",))), "inconsistent-derived-artifact-lineage"),
+            ("invalid authority", replace(artifact,
+             catalog_admission_metadata=replace(artifact.catalog_admission_metadata,
+             production_authority="UPGRADED"),
+             producer_provenance=replace(artifact.producer_provenance,
+             production_authority="UPGRADED")), "unsupported-production-authority"),
+        )
+        before = artifact.to_dict()
+        for name, invalid, expected in cases:
+            with self.subTest(name=name):
+                result = assembler.assemble(ExecutiveIntelligencePackageRequest(), invalid)
+                self.assertFalse(result.packaged)
+                self.assertIsNone(result.package)
+                self.assertIn(expected, issue_codes(result))
+        self.assertEqual(artifact.to_dict(), before)
+
     def test_assessment_service_snapshot_progresses_to_package(self):
         _snapshot, _admission_result, _derivation_result, package_result = (
             produce_package_pipeline()

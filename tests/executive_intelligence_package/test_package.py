@@ -152,6 +152,35 @@ class ExecutiveIntelligencePackageTests(unittest.TestCase):
             "assessment-service-snapshot-001",
         )
         self.assertIs(result.package.source_derived_artifact, artifact)
+        self.assertNotIn(
+            "governedConclusions",
+            result.package.to_dict()["sourceDerivedArtifact"],
+        )
+        self.assertEqual(
+            result.package.to_dict()["sourceDerivedArtifact"],
+            artifact.to_dict(),
+        )
+
+    def test_rejects_unknown_derived_artifact_rule(self):
+        artifact = derived_artifact()
+        unsupported = SnapshotDerivedArtifact(
+            producer_snapshot_identity=artifact.producer_snapshot_identity,
+            snapshot_contract_version=artifact.snapshot_contract_version,
+            assessment_version=artifact.assessment_version,
+            methodology_version=artifact.methodology_version,
+            catalog_admission_metadata=artifact.catalog_admission_metadata,
+            compatibility_validation_metadata=artifact.compatibility_validation_metadata,
+            producer_provenance=artifact.producer_provenance,
+            derivation_rule_version="unsupported-derivation-rule-v3",
+            derivation_runtime_version=artifact.derivation_runtime_version,
+        )
+
+        result = ExecutiveIntelligencePackageAssembler().assemble(
+            ExecutiveIntelligencePackageRequest(), unsupported,
+        )
+        self.assertFalse(result.packaged)
+        self.assertIsNone(result.package)
+        self.assertEqual(issue_codes(result), ("unsupported-derived-artifact-rule",))
 
     def test_rejects_raw_snapshot(self):
         result = ExecutiveIntelligencePackageAssembler().assemble(

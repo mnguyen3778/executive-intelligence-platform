@@ -13,9 +13,23 @@ from typing import Any
 
 from executive_intelligence_platform.snapshot_catalog import SnapshotAdmissionMetadata
 from executive_intelligence_platform.snapshot_derivation import (
+    SNAPSHOT_DERIVATION_RULE_VERSION,
+    SNAPSHOT_DERIVATION_RUNTIME_VERSION,
     SnapshotCompatibilityValidationMetadata,
     SnapshotDerivedArtifact,
     SnapshotProducerProvenance,
+)
+from executive_intelligence_platform.snapshot_derivation.derivation import (
+    GOVERNED_CONTENT_DERIVATION_RULE_VERSION,
+)
+from executive_intelligence_platform.snapshot_compatibility.compatibility import (
+    GOVERNED_ASSESSMENT_VERSION,
+    GOVERNED_PACKAGE_CONTRACT_VERSION,
+    PACKAGE_SOURCE_COMPONENTS,
+    RESPONSE_STATUS_ALLOWED_VALUES,
+    SUPPORTED_METHODOLOGY_VERSION,
+    SUPPORTED_RESPONSE_CONTRACT_VERSION,
+    _governed_conclusions_match_contract,
 )
 
 
@@ -48,6 +62,18 @@ EXECUTIVE_INTELLIGENCE_PACKAGE_ISSUE_CODES = MappingProxyType(
         ),
         "inconsistent-derived-artifact-lineage": (
             "Derived artifact lineage references are inconsistent."
+        ),
+        "unsupported-derived-artifact-rule": (
+            "Derived artifact uses an unsupported derivation rule."
+        ),
+        "unsupported-governed-version": (
+            "Governed artifact version binding does not match the frozen contract."
+        ),
+        "invalid-governed-conclusions": (
+            "Governed conclusions are missing or malformed."
+        ),
+        "unsupported-production-authority": (
+            "Derived artifact production authority is not a supported classification."
         ),
     }
 )
@@ -305,7 +331,84 @@ def _validate_derived_artifact(
         return issues
 
     issues.extend(_validate_lineage_consistency(derived_artifact))
+    if issues:
+        return issues
+    issues.extend(_validate_derived_artifact_rule(derived_artifact))
     return issues
+
+
+def _validate_derived_artifact_rule(
+    artifact: SnapshotDerivedArtifact,
+) -> list[ExecutiveIntelligencePackageIssue]:
+    rule = artifact.derivation_rule_version
+    if rule not in (
+        SNAPSHOT_DERIVATION_RULE_VERSION,
+        GOVERNED_CONTENT_DERIVATION_RULE_VERSION,
+    ):
+        return [_issue(
+            "unsupported-derived-artifact-rule",
+            "$.derivedArtifacts[0].derivationRuleVersion",
+            "Derived artifact derivation rule is not supported for package assembly.",
+        )]
+    if rule == SNAPSHOT_DERIVATION_RULE_VERSION:
+        if artifact.governed_conclusions is not None:
+            return [_issue(
+                "invalid-governed-conclusions",
+                "$.derivedArtifacts[0].governedConclusions",
+                "Legacy lineage-only artifacts cannot carry governed conclusions.",
+            )]
+        return []
+
+    admission = artifact.catalog_admission_metadata
+    versions = (
+        artifact.snapshot_contract_version,
+        admission.package_contract_version,
+        artifact.assessment_version,
+        artifact.methodology_version,
+        artifact.derivation_runtime_version,
+    )
+    expected = (
+        SUPPORTED_RESPONSE_CONTRACT_VERSION,
+        GOVERNED_PACKAGE_CONTRACT_VERSION,
+        GOVERNED_ASSESSMENT_VERSION,
+        SUPPORTED_METHODOLOGY_VERSION,
+        SNAPSHOT_DERIVATION_RUNTIME_VERSION,
+    )
+    if versions != expected:
+        return [_issue(
+            "unsupported-governed-version",
+            "$.derivedArtifacts[0].catalogAdmissionMetadata",
+            "Governed package input requires the frozen v2 version binding.",
+        )]
+    if tuple(admission.source_component_ids) != PACKAGE_SOURCE_COMPONENTS:
+        return [_issue(
+            "inconsistent-derived-artifact-lineage",
+            "$.derivedArtifacts[0].catalogAdmissionMetadata.sourceComponentIds",
+            "Governed source components do not match producer provenance.",
+        )]
+    if (
+        not isinstance(admission.production_authority, str)
+        or admission.production_authority not in RESPONSE_STATUS_ALLOWED_VALUES[
+            "productionAuthority"
+        ]
+    ):
+        return [_issue(
+            "unsupported-production-authority",
+            "$.derivedArtifacts[0].catalogAdmissionMetadata.productionAuthority",
+            "Governed producer authority classification is not supported.",
+        )]
+    try:
+        serialized = artifact.to_dict().get("governedConclusions")
+        valid = _governed_conclusions_match_contract(serialized)
+    except (TypeError, ValueError, KeyError, AttributeError):
+        valid = False
+    if not valid:
+        return [_issue(
+            "invalid-governed-conclusions",
+            "$.derivedArtifacts[0].governedConclusions",
+            "Governed conclusions do not match the frozen producer structure.",
+        )]
+    return []
 
 
 def _validate_lineage_consistency(
@@ -368,8 +471,11 @@ def _validate_lineage_consistency(
                 )
             )
 
-    if tuple(admission_metadata.source_component_ids) != tuple(
-        producer_provenance.source_component_ids
+    if (
+        not isinstance(admission_metadata.source_component_ids, tuple)
+        or not isinstance(producer_provenance.source_component_ids, tuple)
+        or admission_metadata.source_component_ids
+        != producer_provenance.source_component_ids
     ):
         issues.append(
             _issue(
