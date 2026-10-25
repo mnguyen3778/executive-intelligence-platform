@@ -24,6 +24,8 @@ from executive_intelligence_platform.executive_intelligence_projection import (
     EXECUTIVE_INTELLIGENCE_PROJECTION_RULE_VERSION,
     ExecutiveIntelligenceProjection,
     ExecutiveIntelligenceProjectionLineage,
+    ExecutiveIntelligenceProjectionProjector,
+    ExecutiveIntelligenceProjectionRequest,
 )
 
 
@@ -1006,6 +1008,29 @@ def _validate_projection(
                 "Package assembly rule is not compatible for delivery.",
             )
         )
+
+    if issues:
+        return issues
+
+    canonical = ExecutiveIntelligenceProjectionProjector().project(
+        ExecutiveIntelligenceProjectionRequest(), projection.source_package
+    )
+    if not canonical.projected:
+        return [
+            _issue(
+                "upstream-projection-unavailable",
+                "$.projection.sourcePackage",
+                "Projection source package fails existing projection validation.",
+            )
+        ]
+    if projection != canonical.projection:
+        return [
+            _issue(
+                "lineage-state-incomplete",
+                "$.projection",
+                "Projection fields or lineage conflict with its validated source package.",
+            )
+        ]
 
     issues.extend(_validate_projection_lineage_consistency(projection))
     return issues

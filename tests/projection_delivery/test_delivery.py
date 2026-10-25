@@ -1,7 +1,7 @@
 import json
 import sys
 import unittest
-from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError, replace
 from pathlib import Path
 from unittest.mock import patch
 
@@ -593,9 +593,7 @@ class WebsiteProjectionDeliveryTests(unittest.TestCase):
         self.assertIsNone(result.delivery)
         self.assertIn("projection-contract-version-unsupported", issue_codes(result))
 
-    def test_no_snapshot_validation_catalog_derivation_package_or_projection_creation(
-        self,
-    ):
+    def test_delivery_reuses_projection_without_snapshot_or_derivation_work(self):
         projection = executive_projection()
         publisher = WebsiteProjectionDeliveryPublisher()
         request = WebsiteProjectionDeliveryRequest()
@@ -611,19 +609,62 @@ class WebsiteProjectionDeliveryTests(unittest.TestCase):
             SnapshotDerivationRuntime,
             "derive",
             side_effect=AssertionError("derivation must not be called"),
-        ), patch.object(
-            ExecutiveIntelligencePackageAssembler,
-            "assemble",
-            side_effect=AssertionError("package assembly must not be called"),
-        ), patch.object(
-            ExecutiveIntelligenceProjectionProjector,
-            "project",
-            side_effect=AssertionError("projection creation must not be called"),
         ):
             result = publisher.publish(request, projection)
 
         self.assertTrue(result.delivered)
         self.assertEqual(result.issues, ())
+
+    def test_rejects_projection_with_invalid_embedded_package(self):
+        source = executive_projection()
+        invalid_package = replace(source.source_package, source_derived_artifact=None)
+        forged = replace(source, source_package=invalid_package)
+
+        result = delivery_result(projection=forged)
+
+        self.assertFalse(result.delivered)
+        self.assertIsNone(result.delivery)
+        self.assertEqual(issue_codes(result), ("upstream-projection-unavailable",))
+        self.assertIs(forged.source_package, invalid_package)
+        self.assertIsNone(invalid_package.source_derived_artifact)
+
+    def test_rejects_projection_with_conflicting_package_metadata(self):
+        source = executive_projection()
+        package = source.source_package
+        invalid_package = replace(
+            package,
+            assessment_version="conflicting-assessment",
+            lineage=replace(
+                package.lineage, assessment_version="conflicting-assessment"
+            ),
+        )
+        forged = replace(source, source_package=invalid_package)
+        before = forged.to_dict()
+
+        result = delivery_result(projection=forged)
+
+        self.assertFalse(result.delivered)
+        self.assertIsNone(result.delivery)
+        self.assertEqual(issue_codes(result), ("upstream-projection-unavailable",))
+        self.assertEqual(forged.to_dict(), before)
+
+    def test_rejects_projection_conflicting_with_valid_source_package(self):
+        source = executive_projection()
+        forged = replace(
+            source,
+            assessment_version="conflicting-assessment",
+            lineage=replace(
+                source.lineage, assessment_version="conflicting-assessment"
+            ),
+        )
+        before = forged.to_dict()
+
+        result = delivery_result(projection=forged)
+
+        self.assertFalse(result.delivered)
+        self.assertIsNone(result.delivery)
+        self.assertEqual(issue_codes(result), ("lineage-state-incomplete",))
+        self.assertEqual(forged.to_dict(), before)
 
     def test_delivery_output_contains_no_assessment_service_business_logic(self):
         delivery = delivery_result().delivery.to_dict()
