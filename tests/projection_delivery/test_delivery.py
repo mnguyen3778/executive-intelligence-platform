@@ -35,6 +35,11 @@ from executive_intelligence_platform.projection_delivery import (  # noqa: E402
     WebsiteProjectionDisplayField,
     WebsiteProjectionRenderingGuidance,
 )
+from executive_intelligence_platform.projection_delivery.delivery import (  # noqa: E402
+    _MAX_SERIALIZED_JSON_CANDIDATE_CHARS,
+    _MAX_SERIALIZED_JSON_CONTAINER_DEPTH,
+    _find_prohibited_key,
+)
 from executive_intelligence_platform.snapshot_catalog import (  # noqa: E402
     SnapshotCatalog,
 )
@@ -217,6 +222,31 @@ def approved_dashboard_content():
 def approved_rendering_guidance():
     return WebsiteProjectionRenderingGuidance(
         section_order=("summaries", "metrics"),
+    )
+
+
+def dashboard_text_request(value):
+    content = WebsiteProjectionDashboardContent(
+        sections=(
+            (
+                "summaries",
+                WebsiteProjectionContentSection(
+                    label="Executive Summary",
+                    items=(
+                        WebsiteProjectionContentItem(
+                            label="Text",
+                            fields=(
+                                WebsiteProjectionDisplayField(label="Text", value=value),
+                            ),
+                        ),
+                    ),
+                ),
+            ),
+        )
+    )
+    return WebsiteProjectionDeliveryRequest(
+        field_classifications=APPROVED_FIELD_CLASSIFICATIONS,
+        dashboard_content=content,
     )
 
 
@@ -1056,6 +1086,121 @@ class WebsiteProjectionDeliveryTests(unittest.TestCase):
         )
         for key in generated_content_keys:
             self.assertFalse(contains_key(payload, key), key)
+
+    def test_rejects_serialized_prohibited_artifacts_in_dashboard_text(self):
+        projection = executive_projection()
+        cases = (
+            ("source package", '{"sourcePackage":{"marker":"test"}}'),
+            ("derived artifact", '{"sourceDerivedArtifact":{"marker":"test"}}'),
+            ("nested object", '{"allowed":{"sourcePackage":{}}}'),
+            ("nested array", '[{"allowed":{"sourceDerivedArtifact":{}}}]'),
+            (
+                "multiple levels",
+                '{"allowed":[{"deeper":[{"sourcePackage":{}}]}]}',
+            ),
+            ("surrounding whitespace", ' \n {"sourcePackage":{}} \t '),
+            ("Unicode escaped key", r'{"source\u0050ackage":{}}'),
+            ("JSON escaped key", r'{"\u0073ourcePackage":{}}'),
+            ("serialized projection", json.dumps(projection.to_dict())),
+        )
+        publisher = WebsiteProjectionDeliveryPublisher()
+        for name, value in cases:
+            with self.subTest(name=name):
+                request = dashboard_text_request(value)
+                before_request = request.to_dict()
+                before_projection = projection.to_dict()
+
+                result = publisher.publish(request, projection)
+
+                self.assertFalse(result.delivered)
+                self.assertIsNone(result.delivery)
+                self.assertEqual(issue_codes(result), ("prohibited-field-present",))
+                self.assertEqual(request.to_dict(), before_request)
+                self.assertEqual(projection.to_dict(), before_projection)
+
+    def test_rejects_serialized_json_candidates_exceeding_parse_limits(self):
+        oversized = '{"allowed":"' + "x" * _MAX_SERIALIZED_JSON_CANDIDATE_CHARS + '"}'
+        deeply_nested = "[" * (_MAX_SERIALIZED_JSON_CONTAINER_DEPTH + 2)
+        deeply_nested += "0" + "]" * (_MAX_SERIALIZED_JSON_CONTAINER_DEPTH + 2)
+        projection = executive_projection()
+        for name, value in (("oversized", oversized), ("deep", deeply_nested)):
+            with self.subTest(name=name):
+                request = dashboard_text_request(value)
+                before = request.to_dict()
+
+                result = WebsiteProjectionDeliveryPublisher().publish(
+                    request, projection
+                )
+
+                self.assertFalse(result.delivered)
+                self.assertIsNone(result.delivery)
+                self.assertEqual(issue_codes(result), ("delivery-payload-malformed",))
+                self.assertEqual(request.to_dict(), before)
+
+        request = dashboard_text_request('{"allowed":true}')
+        before = request.to_dict()
+        with patch(
+            "executive_intelligence_platform.projection_delivery.delivery.json.loads",
+            side_effect=RecursionError,
+        ):
+            result = WebsiteProjectionDeliveryPublisher().publish(request, projection)
+        self.assertFalse(result.delivered)
+        self.assertIsNone(result.delivery)
+        self.assertEqual(issue_codes(result), ("delivery-payload-malformed",))
+        self.assertEqual(request.to_dict(), before)
+
+    def test_existing_scanner_still_finds_raw_nested_keys(self):
+        self.assertEqual(
+            _find_prohibited_key({"outer": {"sourcePackage": {}}}),
+            "$.outer.sourcePackage",
+        )
+        self.assertEqual(
+            _find_prohibited_key({"outer": [{"sourceDerivedArtifact": {}}]}),
+            "$.outer[0].sourceDerivedArtifact",
+        )
+
+    def test_allows_narrative_and_harmless_json_without_changing_text(self):
+        cases = (
+            "The executive summary describes the current position.",
+            "The finding identifies a governance gap.",
+            "The recommendation addresses the source gap.",
+            "Risk remains high; next steps are clear.",
+            "The draft uses {braces} and punctuation: commas, semicolons; and periods.",
+            'The word "sourcePackage" appears in a quoted example.',
+            '{"example":"safe"}',
+            '{"allowed":{"nested":"safe"}}',
+            '[{"allowed":{"nested":"safe"}}]',
+            "Executive narrative. " * 4000,
+            '{"sourcePackage": not valid JSON}',
+            '{"sourcePackage":{}} followed by prose',
+            json.dumps('{"sourcePackage":{}}'),
+            json.dumps({"allowed": json.dumps({"sourcePackage": {}})}),
+        )
+        publisher = WebsiteProjectionDeliveryPublisher()
+        projection = executive_projection()
+        for value in cases:
+            with self.subTest(value=value[:80]):
+                request = dashboard_text_request(value)
+                before = request.to_dict()
+
+                first = publisher.publish(request, projection)
+                second = publisher.publish(request, projection)
+
+                self.assertTrue(first.delivered, first.issues)
+                self.assertEqual(first.issues, ())
+                self.assertEqual(first.to_dict(), second.to_dict())
+                serialized = first.delivery.to_dict()
+                self.assertEqual(
+                    serialized["dashboardContent"]["summaries"]["items"][0][
+                        "fields"
+                    ][0]["value"],
+                    value,
+                )
+                serialized["dashboardContent"]["summaries"]["items"][0][
+                    "fields"
+                ][0]["value"] = "changed"
+                self.assertEqual(first.delivery.to_dict(), second.delivery.to_dict())
+                self.assertEqual(request.to_dict(), before)
 
 
 if __name__ == "__main__":

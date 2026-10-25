@@ -181,6 +181,16 @@ PROHIBITED_DELIVERY_KEYS = (
     "dashboardState",
 )
 
+# Bound parsing of serialized JSON containers in otherwise unrestricted text fields.
+_MAX_SERIALIZED_JSON_CANDIDATE_CHARS = 65_536
+_MAX_SERIALIZED_JSON_CONTAINER_DEPTH = 64
+
+
+class _SerializedJsonLimitError(ValueError):
+    def __init__(self, path: str) -> None:
+        self.path = path
+        super().__init__(path)
+
 
 @dataclass(frozen=True)
 class WebsiteProjectionDeliveryIssue:
@@ -681,7 +691,20 @@ class WebsiteProjectionDeliveryPublisher:
             return _result(False, None, issues)
 
         delivery = _build_delivery(request, projection)
-        prohibited_path = _find_prohibited_key(delivery.to_dict())
+        try:
+            prohibited_path = _find_prohibited_key(delivery.to_dict())
+        except _SerializedJsonLimitError as error:
+            return _result(
+                False,
+                None,
+                [
+                    _issue(
+                        "delivery-payload-malformed",
+                        error.path,
+                        "Serialized JSON container exceeds the safe parsing limit.",
+                    )
+                ],
+            )
         if prohibited_path is not None:
             return _result(
                 False,
@@ -1362,20 +1385,54 @@ def _valid_rendering_guidance(value: object) -> bool:
     return len(value.section_order) == len(set(value.section_order))
 
 
-def _find_prohibited_key(value: object, path: str = "$") -> str | None:
+def _find_prohibited_key(
+    value: object,
+    path: str = "$",
+    *,
+    inspect_strings: bool = True,
+    json_depth: int | None = None,
+) -> str | None:
+    if json_depth is not None and json_depth > _MAX_SERIALIZED_JSON_CONTAINER_DEPTH:
+        raise _SerializedJsonLimitError(path)
     if isinstance(value, dict):
         for key, child in value.items():
             child_path = f"{path}.{key}"
             if key in PROHIBITED_DELIVERY_KEYS:
                 return child_path
-            found = _find_prohibited_key(child, child_path)
+            found = _find_prohibited_key(
+                child,
+                child_path,
+                inspect_strings=inspect_strings,
+                json_depth=None if json_depth is None else json_depth + 1,
+            )
             if found is not None:
                 return found
     if isinstance(value, list):
         for index, child in enumerate(value):
-            found = _find_prohibited_key(child, f"{path}[{index}]")
+            found = _find_prohibited_key(
+                child,
+                f"{path}[{index}]",
+                inspect_strings=inspect_strings,
+                json_depth=None if json_depth is None else json_depth + 1,
+            )
             if found is not None:
                 return found
+    if isinstance(value, str) and inspect_strings:
+        candidate = value.lstrip()
+        if not candidate.startswith(("{", "[")):
+            return None
+        if len(candidate) > _MAX_SERIALIZED_JSON_CANDIDATE_CHARS:
+            raise _SerializedJsonLimitError(path)
+        try:
+            decoded = json.loads(candidate)
+        except json.JSONDecodeError:
+            return None
+        except RecursionError:
+            raise _SerializedJsonLimitError(path) from None
+        if isinstance(decoded, (dict, list)):
+            return _find_prohibited_key(
+                decoded, path, inspect_strings=False, json_depth=0
+            )
     return None
 
 
