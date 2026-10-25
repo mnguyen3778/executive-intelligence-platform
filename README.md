@@ -38,17 +38,39 @@ These documents define repository ownership, bounded context rules, architectura
 
 ## Current Scope
 
-This repository currently contains only the permanent governance baseline.
+This repository contains approved consumer-side snapshot admission, derivation,
+projection, and delivery work. The Assessment Service remains the sole producer
+of governed assessment conclusions. Further implementation still requires
+explicit approval through the governance process.
 
-The following are intentionally not defined yet:
+## Local Phase 1G dependency setup
 
-- Sprint 1 architecture
-- implementation
-- runtime
-- APIs
-- persistence
-- AWS infrastructure
-- databases
-- technology decisions
+Use Python `>=3.14,<3.15` with the Assessment Service checkout beside this
+repository, as `../nguyen-ai-assessment-service`. Its Python distribution is
+`nguyen-ai-assessment-service==0.1.0`; the import package is named `assessment`.
+EIP's verified admission imports `assessment.producer_snapshot_attestation`.
+The producer distribution supplies the pinned `cryptography==50.0.2` runtime
+dependency. EIP currently has no separate development requirements file or
+installable distribution; its own source is selected with `PYTHONPATH=src`.
 
-No implementation work may begin until explicitly approved through the governance process.
+From the EIP repository root, create a fresh environment outside both
+repositories and run:
+
+```bash
+env_root=$(mktemp -d "${TMPDIR:-/tmp}/eip-phase1g.XXXXXX")
+python3.14 -m venv "$env_root/venv"
+. "$env_root/venv/bin/activate"
+python -m pip install -e ../nguyen-ai-assessment-service
+python -c 'import assessment.producer_snapshot_attestation; import importlib.metadata as m; assert m.version("nguyen-ai-assessment-service") == "0.1.0"'
+PYTHONPATH=src python -c 'import executive_intelligence_platform.projection_delivery.verified_admission'
+PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src python -m unittest discover -s tests/projection_delivery -p test_verified_admission.py -q
+```
+
+The editable install reads a mutable local producer checkout. The existing EIP
+cross-repository tests also insert the sibling producer source path themselves;
+their passing result alone does not establish an installed dependency. A local
+wheel built from the current candidate is likewise not an immutable release.
+Phase 1G promotion must first commit the producer attestation and packaging
+metadata at an identifiable revision, then commit EIP's reproducible setup.
+These local instructions do not establish production dependency packaging,
+signing-key custody, or deployment readiness.

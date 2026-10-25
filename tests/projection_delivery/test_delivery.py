@@ -39,6 +39,7 @@ from executive_intelligence_platform.projection_delivery.delivery import (  # no
     _MAX_SERIALIZED_JSON_CANDIDATE_CHARS,
     _MAX_SERIALIZED_JSON_CONTAINER_DEPTH,
     _find_prohibited_key,
+    _publish_governed_dashboard_content,
 )
 from executive_intelligence_platform.snapshot_catalog import (  # noqa: E402
     SnapshotCatalog,
@@ -275,6 +276,55 @@ def contains_key(value, key_name):
 
 
 class WebsiteProjectionDeliveryTests(unittest.TestCase):
+    def test_governed_opt_in_rejects_legacy_v1_without_changing_default(self):
+        projection = executive_projection()
+        request = WebsiteProjectionDeliveryRequest()
+        ordinary = WebsiteProjectionDeliveryPublisher().publish(request, projection)
+        governed = _publish_governed_dashboard_content(request, projection)
+        self.assertTrue(ordinary.delivered)
+        self.assertNotIn("dashboardContent", ordinary.delivery.to_dict())
+        self.assertFalse(governed.delivered)
+        self.assertIsNone(governed.delivery)
+        self.assertEqual(issue_codes(governed), ("compatibility-state-not-compatible",))
+
+    def test_governed_opt_in_rejects_caller_content_without_mutation(self):
+        request = WebsiteProjectionDeliveryRequest(
+            dashboard_content=approved_dashboard_content(),
+            field_classifications=APPROVED_FIELD_CLASSIFICATIONS,
+        )
+        before = request.to_dict()
+        projection = executive_projection()
+        ordinary = WebsiteProjectionDeliveryPublisher().publish(request, projection)
+        governed = _publish_governed_dashboard_content(request, projection)
+        self.assertTrue(ordinary.delivered)
+        self.assertEqual(
+            ordinary.delivery.to_dict()["dashboardContent"],
+            request.dashboard_content.to_dict(),
+        )
+        self.assertFalse(governed.delivered)
+        self.assertIsNone(governed.delivery)
+        self.assertEqual(issue_codes(governed), ("delivery-payload-malformed",))
+        self.assertEqual(request.to_dict(), before)
+
+    def test_governed_opt_in_preserves_request_and_projection_validation(self):
+        projection = executive_projection()
+        cases = (
+            (WebsiteProjectionDeliveryRequest(publication_state="draft"), projection,
+             "publication-state-not-published"),
+            (WebsiteProjectionDeliveryRequest(), replace(projection, assessment_version="wrong"),
+             "lineage-state-incomplete"),
+        )
+        for request, candidate, code in cases:
+            with self.subTest(code=code):
+                before_request = request.to_dict()
+                before_projection = candidate.to_dict()
+                result = _publish_governed_dashboard_content(request, candidate)
+                self.assertFalse(result.delivered)
+                self.assertIsNone(result.delivery)
+                self.assertIn(code, issue_codes(result))
+                self.assertEqual(request.to_dict(), before_request)
+                self.assertEqual(candidate.to_dict(), before_projection)
+
     def test_generates_valid_delivery_from_existing_projection(self):
         result = delivery_result()
 
@@ -563,6 +613,8 @@ class WebsiteProjectionDeliveryTests(unittest.TestCase):
             "delivery-payload-malformed",
             "upstream-projection-unavailable",
             "publication-policy-violation",
+            "verified-admission-required",
+            "verified-admission-invalid",
         }
 
         self.assertEqual(

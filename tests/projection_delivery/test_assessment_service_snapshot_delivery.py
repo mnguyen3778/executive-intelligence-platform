@@ -6,7 +6,9 @@ import sys
 import unittest
 from dataclasses import replace
 from pathlib import Path
+from unittest.mock import patch
 
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 EIP_ROOT = Path(__file__).resolve().parents[2]
 ASSESSMENT_SERVICE_ROOT = EIP_ROOT.parent / "nguyen-ai-assessment-service"
@@ -17,6 +19,7 @@ sys.path.insert(0, str(ASSESSMENT_SERVICE_ROOT / "tests"))
 from assessment.executive_snapshot_handoff import (  # noqa: E402
     produce_executive_assessment_snapshot,
 )
+from assessment.producer_snapshot_attestation import ProducerSnapshotIssuer  # noqa: E402
 from test_golden_fixture_regression import request as golden_fixture_request  # noqa: E402
 from executive_intelligence_platform.executive_intelligence_package import (  # noqa: E402
     ExecutiveIntelligencePackageAssembler,
@@ -44,19 +47,43 @@ from executive_intelligence_platform.snapshot_derivation import (  # noqa: E402
 from executive_intelligence_platform.snapshot_derivation.derivation import (  # noqa: E402
     GOVERNED_CONTENT_DERIVATION_RULE_VERSION,
 )
+from executive_intelligence_platform.projection_delivery.delivery import (  # noqa: E402
+    _publish_governed_dashboard_content,
+    WebsiteProjectionContentItem,
+    WebsiteProjectionContentSection,
+    WebsiteProjectionDashboardContent,
+    WebsiteProjectionDisplayField,
+)
+from executive_intelligence_platform.projection_delivery.verified_admission import (  # noqa: E402
+    VerifiedSnapshotGateway,
+)
 
 
-def governed_delivery_pipeline():
+def governed_delivery_pipeline(finding_profile="two-high"):
     production = produce_executive_assessment_snapshot(
-        golden_fixture_request(75, "mixed-strong", "two-high")
+        golden_fixture_request(75, "mixed-strong", finding_profile)
     )
     if not production.is_success:
         raise AssertionError(production.failure)
     snapshot = production.serialized_snapshot
+    raw = json.dumps(snapshot, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    signing_key = Ed25519PrivateKey.generate()
+    sidecar = ProducerSnapshotIssuer(
+        signing_key, issuer_id="nguyen-ai-assessment",
+        key_id="phase1g-test-ephemeral",
+        producer_release_commit="a075a679a053ee9d0eb9a32d7f0ffa2dc796f0da",
+    ).issue(raw)
+    gateway = VerifiedSnapshotGateway(
+        trusted_issuer_id="nguyen-ai-assessment",
+        trusted_key_id="phase1g-test-ephemeral",
+        trusted_public_key=signing_key.public_key(),
+        expected_release_commit="a075a679a053ee9d0eb9a32d7f0ffa2dc796f0da",
+    )
+    verified_admission = gateway.admit(raw, sidecar)
     compatibility = validate_snapshot_compatibility(snapshot)
     catalog = SnapshotCatalog()
     admission = catalog.admit(
-        snapshot, producer_snapshot_identity="fixture-v1-high-concentration-risk"
+        snapshot, producer_snapshot_identity=sidecar["producerSnapshotIdentity"]
     )
     if not admission.accepted:
         raise AssertionError(admission.issues)
@@ -79,7 +106,8 @@ def governed_delivery_pipeline():
     delivery = WebsiteProjectionDeliveryPublisher().publish(
         WebsiteProjectionDeliveryRequest(), projection.projection
     )
-    return snapshot, compatibility, admission, derivation, package, projection, delivery
+    return (snapshot, compatibility, admission, derivation, package, projection,
+            delivery, gateway, verified_admission)
 
 
 def issue_codes(result):
@@ -87,8 +115,194 @@ def issue_codes(result):
 
 
 class FrozenAssessmentServiceProjectionDeliveryTests(unittest.TestCase):
+    def test_governed_dashboard_omits_empty_findings_section(self):
+        snapshot, _compatibility, _admission, _derivation, _package, projection, _, gateway, verified = (
+            governed_delivery_pipeline("none")
+        )
+        self.assertEqual(
+            snapshot["businessDecisionPackage"]["governedConclusions"]
+            ["severityAssignedFindings"], []
+        )
+        result = _publish_governed_dashboard_content(
+            WebsiteProjectionDeliveryRequest(), projection.projection,
+            verified_admission=verified, trusted_gateway=gateway,
+        )
+        self.assertTrue(result.delivered, result.issues)
+        self.assertNotIn("findings", result.delivery.to_dict()["dashboardContent"])
+
+    def test_governed_dashboard_opt_in_copies_frozen_conclusions(self):
+        snapshot, compatibility, admission, derivation, package, projection, ordinary, gateway, verified = (
+            governed_delivery_pipeline()
+        )
+        self.assertTrue(all((compatibility.is_valid, admission.accepted,
+                             derivation.derived, package.packaged,
+                             projection.projected, ordinary.delivered)))
+        governed = snapshot["businessDecisionPackage"]["governedConclusions"]
+        request = WebsiteProjectionDeliveryRequest()
+        before_request = request.to_dict()
+        before_projection = projection.projection.to_dict()
+        first = _publish_governed_dashboard_content(
+            request, projection.projection,
+            verified_admission=verified, trusted_gateway=gateway,
+        )
+        second = _publish_governed_dashboard_content(
+            request, projection.projection,
+            verified_admission=verified, trusted_gateway=gateway,
+        )
+        self.assertTrue(first.delivered, first.issues)
+        self.assertEqual(first.issues, ())
+        self.assertEqual(first.to_dict(), second.to_dict())
+        payload = first.delivery.to_dict()
+        content = payload["dashboardContent"]
+        self.assertEqual(tuple(content), (
+            "summaries", "metrics", "findings", "risks", "recommendations"
+        ))
+        self.assertNotIn("decisions", content)
+        self.assertEqual(tuple(len(section["items"]) for section in content.values()),
+                         (7, 1, 2, 1, 2))
+        self.assertEqual(sum(len(section["items"]) for section in content.values()), 13)
+        self.assertEqual(
+            [(item["fields"][0]["value"], item["summary"])
+             for item in content["summaries"]["items"]],
+            list(governed["executiveSummary"]["sectionText"].items()),
+        )
+        self.assertEqual(
+            [(item["label"], [field["value"] for field in item["fields"]])
+             for item in content["findings"]["items"]],
+            [(finding["title"], [finding["findingId"],
+               finding["sequenceIdentifier"], finding["severityClassification"]])
+             for finding in governed["severityAssignedFindings"]],
+        )
+        self.assertEqual(
+            content["risks"]["items"][0]["fields"][0]["value"],
+            governed["assessmentRisk"]["riskClassification"],
+        )
+        self.assertEqual(
+            content["metrics"]["items"][0]["fields"][0]["value"],
+            governed["confidence"]["confidenceClassification"],
+        )
+        self.assertEqual(
+            [[field["value"] for field in item["fields"]]
+             for item in content["recommendations"]["items"]],
+            [[item["findingId"], item["recommendationClassification"]]
+            for item in governed["recommendations"]],
+        )
+        self.assertEqual(payload["classification"]["responseClassification"],
+                         "restricted_assessment")
+        self.assertIn(
+            {"fieldGroup": "dashboardContent", "classification": "restricted_assessment"},
+            payload["classification"]["fieldClassifications"],
+        )
+        self.assertNotIn("delivery-contract-exposes-projection-metadata-and-lineage-only",
+                         payload["limitations"]["limitationIndicators"])
+        self.assertEqual(payload["versionContext"],
+                         ordinary.delivery.to_dict()["versionContext"])
+        self.assertEqual(payload["lineage"], ordinary.delivery.to_dict()["lineage"])
+        self.assertEqual(payload["lineage"]["snapshot"]["productionAuthority"],
+                         "NOT_PRODUCTION_AUTHORITATIVE")
+        serialized = json.dumps(content)
+        for excluded in ("sourceReferences", "sourcePackage", "sourceDerivedArtifact",
+                         "decisionEvaluation", "rawEvidence"):
+            self.assertNotIn(excluded, serialized)
+        payload["dashboardContent"]["summaries"]["items"][0]["summary"] = "changed"
+        self.assertEqual(first.delivery.to_dict(), second.delivery.to_dict())
+        self.assertEqual(request.to_dict(), before_request)
+        self.assertEqual(projection.projection.to_dict(), before_projection)
+        self.assertNotIn("dashboardContent", ordinary.delivery.to_dict())
+
+    def test_governed_dashboard_opt_in_rejects_invalid_upstream_artifacts(self):
+        _snapshot, _compatibility, _admission, derivation, package, projection, _, gateway, verified = (
+            governed_delivery_pipeline()
+        )
+        artifact = derivation.artifact
+
+        def altered(change):
+            conclusions = copy.deepcopy(artifact.to_dict()["governedConclusions"])
+            change(conclusions)
+            return replace(artifact, governed_conclusions=conclusions)
+
+        missing = replace(artifact)
+        object.__setattr__(missing, "governed_conclusions", None)
+        cases = (
+            missing,
+            altered(lambda c: c["severityAssignedFindings"][0].__setitem__(
+                "severityClassification", "unsupported")),
+            altered(lambda c: c["assessmentRisk"].__setitem__(
+                "riskClassification", "moderate-risk")),
+            altered(lambda c: c["severityAssignedFindings"].reverse()),
+            altered(lambda c: c["recommendations"].reverse()),
+            altered(lambda c: c["executiveSummary"]["sectionText"].pop(
+                "closing-assessment-statement")),
+            replace(artifact, producer_snapshot_identity="wrong-snapshot"),
+        )
+        request = WebsiteProjectionDeliveryRequest()
+        for index, invalid in enumerate(cases):
+            with self.subTest(case=index):
+                forged = replace(projection.projection, source_package=replace(
+                    package.package, source_derived_artifact=invalid
+                ))
+                before = forged.to_dict()
+                result = _publish_governed_dashboard_content(
+                    request, forged,
+                    verified_admission=verified, trusted_gateway=gateway,
+                )
+                self.assertFalse(result.delivered)
+                self.assertIsNone(result.delivery)
+                self.assertEqual(issue_codes(result), (
+                    "verified-admission-invalid" if index == 2 else
+                    "upstream-projection-unavailable",
+                ))
+                self.assertEqual(forged.to_dict(), before)
+
+    def test_governed_dashboard_opt_in_rejects_classification_and_generated_content(self):
+        _snapshot, _compatibility, _admission, _derivation, _package, projection, _, gateway, verified = (
+            governed_delivery_pipeline()
+        )
+        request = WebsiteProjectionDeliveryRequest(field_classifications=(
+            *WebsiteProjectionDeliveryRequest().field_classifications,
+            ("dashboardContent", "public"),
+        ))
+        result = _publish_governed_dashboard_content(
+            request, projection.projection,
+            verified_admission=verified, trusted_gateway=gateway,
+        )
+        self.assertFalse(result.delivered)
+        self.assertIsNone(result.delivery)
+        self.assertEqual(issue_codes(result), ("classification-not-approved",))
+
+        invalid = WebsiteProjectionDashboardContent(sections=((
+            "summaries", WebsiteProjectionContentSection(
+                label="Executive Summary", items=(WebsiteProjectionContentItem(
+                    label="invalid", fields=(),
+                ),),
+            ),
+        ),))
+        leaked = WebsiteProjectionDashboardContent(sections=((
+            "summaries", WebsiteProjectionContentSection(
+                label="Executive Summary", items=(WebsiteProjectionContentItem(
+                    label="invalid", fields=(WebsiteProjectionDisplayField(
+                        "text", '{"sourcePackage":{"marker":"safe-test"}}'
+                    ),),
+                ),),
+            ),
+        ),))
+        for generated, code in ((invalid, "delivery-payload-malformed"),
+                                (leaked, "prohibited-field-present")):
+            with self.subTest(code=code):
+                with patch(
+                    "executive_intelligence_platform.projection_delivery.delivery._map_governed_dashboard_content",
+                    return_value=generated,
+                ):
+                    result = _publish_governed_dashboard_content(
+                        WebsiteProjectionDeliveryRequest(), projection.projection,
+                        verified_admission=verified, trusted_gateway=gateway,
+                    )
+                self.assertFalse(result.delivered)
+                self.assertIsNone(result.delivery)
+                self.assertEqual(issue_codes(result), (code,))
+
     def test_frozen_v2_fixture_reaches_metadata_only_delivery(self):
-        snapshot, compatibility, admission, derivation, package, projection, delivery = (
+        snapshot, compatibility, admission, derivation, package, projection, delivery, _gateway, _verified = (
             governed_delivery_pipeline()
         )
         self.assertTrue(compatibility.is_valid)
@@ -161,7 +375,7 @@ class FrozenAssessmentServiceProjectionDeliveryTests(unittest.TestCase):
         self.assertEqual(publication.contract_instance.to_dict(), payload)
 
     def test_frozen_v2_delivery_is_deterministic_and_immutable(self):
-        snapshot, _compatibility, admission, derivation, package, projection, delivery = (
+        snapshot, _compatibility, admission, derivation, package, projection, delivery, _gateway, _verified = (
             governed_delivery_pipeline()
         )
         before_snapshot = copy.deepcopy(snapshot)
@@ -185,7 +399,7 @@ class FrozenAssessmentServiceProjectionDeliveryTests(unittest.TestCase):
         self.assertEqual(snapshot, before_snapshot)
 
     def test_frozen_v2_delivery_rejects_invalid_embedded_artifacts(self):
-        _snapshot, _compatibility, _admission, derivation, package, projection, _delivery = (
+        _snapshot, _compatibility, _admission, derivation, package, projection, _delivery, _gateway, _verified = (
             governed_delivery_pipeline()
         )
         artifact = derivation.artifact
@@ -297,7 +511,7 @@ class FrozenAssessmentServiceProjectionDeliveryTests(unittest.TestCase):
         self.assertEqual(projection.projection.to_dict(), original)
 
     def test_frozen_v2_delivery_rejects_package_and_projection_conflicts(self):
-        _snapshot, _compatibility, _admission, _derivation, package, projection, _delivery = (
+        _snapshot, _compatibility, _admission, _derivation, package, projection, _delivery, _gateway, _verified = (
             governed_delivery_pipeline()
         )
         original = projection.projection

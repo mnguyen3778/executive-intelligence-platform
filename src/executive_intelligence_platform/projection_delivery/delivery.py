@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import json
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from types import MappingProxyType
 from typing import Any
 
@@ -26,6 +26,9 @@ from executive_intelligence_platform.executive_intelligence_projection import (
     ExecutiveIntelligenceProjectionLineage,
     ExecutiveIntelligenceProjectionProjector,
     ExecutiveIntelligenceProjectionRequest,
+)
+from executive_intelligence_platform.snapshot_derivation.derivation import (
+    GOVERNED_CONTENT_DERIVATION_RULE_VERSION,
 )
 
 
@@ -157,10 +160,25 @@ WEBSITE_PROJECTION_DELIVERY_FAILURE_REASON_CODES = MappingProxyType(
         "publication-policy-violation": (
             "Publication governance policy denied delivery."
         ),
+        "verified-admission-required": (
+            "Governed dashboard publication requires verified producer admission."
+        ),
+        "verified-admission-invalid": (
+            "Verified producer admission does not bind this projection."
+        ),
     }
 )
 
 PROHIBITED_DELIVERY_KEYS = (
+    "verificationContractVersion",
+    "issuerId",
+    "producerReleaseCommit",
+    "snapshotDigest",
+    "governedConclusionsDigest",
+    "canonicalizationId",
+    "digestAlgorithm",
+    "keyId",
+    "signature",
     "businessDecisionPackage",
     "sourcePackage",
     "sourceDerivedArtifact",
@@ -668,6 +686,9 @@ class WebsiteProjectionDeliveryPublisher:
         self,
         request: object,
         projection: object,
+        *,
+        verified_admission: object = None,
+        trusted_gateway: object = None,
     ) -> WebsiteProjectionDeliveryResult:
         issues: list[WebsiteProjectionDeliveryIssue] = []
 
@@ -689,6 +710,14 @@ class WebsiteProjectionDeliveryPublisher:
 
         if not isinstance(request, WebsiteProjectionDeliveryRequest):
             return _result(False, None, issues)
+
+        if (request.dashboard_content is not None and
+                projection.derivation_rule_version == GOVERNED_CONTENT_DERIVATION_RULE_VERSION):
+            verification_issue = _governed_verification_issue(
+                projection, verified_admission, trusted_gateway
+            )
+            if verification_issue is not None:
+                return _result(False, None, [verification_issue])
 
         delivery = _build_delivery(request, projection)
         try:
@@ -721,12 +750,236 @@ class WebsiteProjectionDeliveryPublisher:
         return _result(True, delivery, [])
 
 
+def _publish_governed_dashboard_content(
+    request: object,
+    projection: object,
+    *,
+    verified_admission: object = None,
+    trusted_gateway: object = None,
+) -> WebsiteProjectionDeliveryResult:
+    """Opt in to producer-owned display content after signed admission."""
+    publisher = WebsiteProjectionDeliveryPublisher()
+    if not isinstance(request, WebsiteProjectionDeliveryRequest):
+        return publisher.publish(request, projection)
+    if request.dashboard_content is not None:
+        return _result(False, None, [
+            _issue(
+                "delivery-payload-malformed",
+                "$.request.dashboardContent",
+                "Governed mapping cannot replace caller-supplied dashboard content.",
+            )
+        ])
+
+    baseline = publisher.publish(request, projection)
+    if not baseline.delivered:
+        return baseline
+
+    artifact = projection.source_package.source_derived_artifact
+    if artifact.derivation_rule_version != GOVERNED_CONTENT_DERIVATION_RULE_VERSION:
+        return _result(False, None, [
+            _issue(
+                "compatibility-state-not-compatible",
+                "$.projection.derivationRuleVersion",
+                "Governed dashboard mapping requires a v2 derived artifact.",
+            )
+        ])
+
+    verification_issue = _governed_verification_issue(
+        projection, verified_admission, trusted_gateway
+    )
+    if verification_issue is not None:
+        return _result(False, None, [verification_issue])
+
+    classifications = tuple(
+        classification for group, classification in request.field_classifications
+        if group == "dashboardContent"
+    )
+    if classifications and classifications != ("restricted_assessment",):
+        return _result(False, None, [
+            _issue(
+                "classification-not-approved",
+                "$.request.fieldClassifications.dashboardContent",
+                "Governed dashboard content requires restricted assessment classification.",
+            )
+        ])
+
+    limitations = tuple(
+        item for item in request.limitations if item != DEFAULT_LIMITATIONS[0]
+    )
+    if not limitations:
+        return _result(False, None, [
+            _issue(
+                "limitations-not-visible",
+                "$.request.limitations",
+                "Governed delivery requires truthful visible limitations.",
+            )
+        ])
+
+    governed = artifact.to_dict()["governedConclusions"]
+    mapped_request = replace(
+        request,
+        dashboard_content=_map_governed_dashboard_content(governed),
+        field_classifications=(
+            request.field_classifications
+            if classifications else
+            request.field_classifications + (("dashboardContent", "restricted_assessment"),)
+        ),
+        limitations=limitations,
+    )
+    result = publisher.publish(
+        mapped_request, projection,
+        verified_admission=verified_admission, trusted_gateway=trusted_gateway,
+    )
+    if not result.delivered:
+        return result
+    delivery = replace(
+        result.delivery,
+        classification=replace(
+            result.delivery.classification,
+            response_classification="restricted_assessment",
+        ),
+    )
+    return _result(True, delivery, [])
+
+
+def _governed_verification_issue(
+    projection: object,
+    verified_admission: object,
+    trusted_gateway: object,
+) -> WebsiteProjectionDeliveryIssue | None:
+    # Import at the boundary to avoid a module cycle with the gateway pipeline.
+    from .verified_admission import (
+        VerifiedAdmissionError,
+        VerifiedSnapshotAdmission,
+        VerifiedSnapshotGateway,
+    )
+
+    if (type(verified_admission) is not VerifiedSnapshotAdmission or
+            type(trusted_gateway) is not VerifiedSnapshotGateway):
+        return _issue(
+            "verified-admission-required", "$.verifiedAdmission",
+            "Governed dashboard publication requires verified producer admission.",
+        )
+    try:
+        trusted_gateway.verify_projection(verified_admission, projection)
+    except (VerifiedAdmissionError, TypeError, ValueError):
+        return _issue(
+            "verified-admission-invalid", "$.verifiedAdmission",
+            "Verified admission does not bind the supplied projection.",
+        )
+    return None
+
+
+def _map_governed_dashboard_content(
+    governed: dict[str, Any],
+) -> WebsiteProjectionDashboardContent:
+    """Copy approved producer display values without deriving conclusions."""
+    summary_sections = governed["executiveSummary"]["sectionText"]
+    sections = (
+        (
+            "summaries",
+            WebsiteProjectionContentSection(
+                label="Executive Summary",
+                items=tuple(
+                    WebsiteProjectionContentItem(
+                        label=section_id,
+                        fields=(
+                            WebsiteProjectionDisplayField("sectionId", section_id),
+                        ),
+                        summary=section_text,
+                    )
+                    for section_id, section_text in summary_sections.items()
+                ),
+            ),
+        ),
+        (
+            "metrics",
+            WebsiteProjectionContentSection(
+                label="Confidence",
+                items=(WebsiteProjectionContentItem(
+                    label="Confidence",
+                    fields=(WebsiteProjectionDisplayField(
+                        "confidenceClassification",
+                        governed["confidence"]["confidenceClassification"],
+                    ),),
+                ),),
+            ),
+        ),
+        (
+            "findings",
+            WebsiteProjectionContentSection(
+                label="Findings",
+                items=tuple(
+                    WebsiteProjectionContentItem(
+                        label=finding["title"],
+                        fields=(
+                            WebsiteProjectionDisplayField(
+                                "findingId", finding["findingId"]
+                            ),
+                            WebsiteProjectionDisplayField(
+                                "sequenceIdentifier", finding["sequenceIdentifier"]
+                            ),
+                            WebsiteProjectionDisplayField(
+                                "severityClassification",
+                                finding["severityClassification"],
+                            ),
+                        ),
+                    )
+                    for finding in governed["severityAssignedFindings"]
+                ),
+            ),
+        ),
+        (
+            "risks",
+            WebsiteProjectionContentSection(
+                label="Assessment Risk",
+                items=(WebsiteProjectionContentItem(
+                    label="Assessment Risk",
+                    fields=(WebsiteProjectionDisplayField(
+                        "riskClassification",
+                        governed["assessmentRisk"]["riskClassification"],
+                    ),),
+                ),),
+            ),
+        ),
+        (
+            "recommendations",
+            WebsiteProjectionContentSection(
+                label="Recommendations",
+                items=tuple(
+                    WebsiteProjectionContentItem(
+                        label=recommendation["findingId"] or "Recommendation",
+                        fields=tuple(
+                            WebsiteProjectionDisplayField(label, value)
+                            for label, value in (
+                                ("findingId", recommendation["findingId"]),
+                                (
+                                    "recommendationClassification",
+                                    recommendation["recommendationClassification"],
+                                ),
+                            )
+                            if value is not None
+                        ),
+                    )
+                    for recommendation in governed["recommendations"]
+                ),
+            ),
+        ),
+    )
+    return WebsiteProjectionDashboardContent(
+        sections=tuple((name, section) for name, section in sections if section.items)
+    )
+
+
 class WebsiteProjectionDeliveryContractPublisher:
     """Publishes immutable Website delivery contract instances."""
 
     def publish(
         self,
         delivery_result: object,
+        *,
+        verified_admission: object = None,
+        trusted_gateway: object = None,
     ) -> WebsiteProjectionDeliveryContractPublicationResult:
         if not isinstance(delivery_result, WebsiteProjectionDeliveryResult):
             return _publication_result(
@@ -755,6 +1008,36 @@ class WebsiteProjectionDeliveryContractPublisher:
                     )
                 )
             return _publication_result(False, None, issues)
+
+        delivery = delivery_result.delivery
+        if (delivery.dashboard_content is not None and
+                delivery.version_context.derivation_rule_version ==
+                GOVERNED_CONTENT_DERIVATION_RULE_VERSION):
+            from .verified_admission import (
+                VerifiedAdmissionError, VerifiedSnapshotAdmission,
+                VerifiedSnapshotGateway,
+            )
+
+            if (type(verified_admission) is not VerifiedSnapshotAdmission or
+                    type(trusted_gateway) is not VerifiedSnapshotGateway):
+                return _publication_result(False, None, [
+                    _issue(
+                        "verified-admission-required", "$.verifiedAdmission",
+                        "Governed dashboard publication requires verified producer admission.",
+                    )
+                ])
+            try:
+                expected = trusted_gateway.deliver(verified_admission).delivery
+            except (VerifiedAdmissionError, TypeError, ValueError):
+                expected = None
+            if (expected is None or not expected.delivered or
+                    expected.delivery.to_dict() != delivery.to_dict()):
+                return _publication_result(False, None, [
+                    _issue(
+                        "verified-admission-invalid", "$.verifiedAdmission",
+                        "Verified admission does not bind the supplied delivery.",
+                    )
+                ])
 
         return _publication_result(
             True,
