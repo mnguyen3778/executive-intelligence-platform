@@ -1,6 +1,6 @@
 import sys
 import unittest
-from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError, replace
 from pathlib import Path
 
 
@@ -166,6 +166,53 @@ class ExecutiveIntelligenceProjectionTests(unittest.TestCase):
             "assessment-service-snapshot-001",
         )
         self.assertIs(result.projection.source_package, package)
+
+    def test_legacy_package_serialization_is_unchanged(self):
+        package = executive_package()
+        result = ExecutiveIntelligenceProjectionProjector().project(
+            ExecutiveIntelligenceProjectionRequest(), package
+        )
+
+        self.assertTrue(result.projected)
+        self.assertEqual(result.projection.to_dict()["sourcePackage"], package.to_dict())
+        self.assertNotIn(
+            "governedConclusions",
+            result.projection.to_dict()["sourcePackage"]["sourceDerivedArtifact"],
+        )
+
+    def test_rejects_invalid_embedded_artifact(self):
+        package = replace(executive_package(), source_derived_artifact=None)
+
+        result = ExecutiveIntelligenceProjectionProjector().project(
+            ExecutiveIntelligenceProjectionRequest(), package
+        )
+
+        self.assertFalse(result.projected)
+        self.assertIsNone(result.projection)
+        self.assertEqual(
+            issue_codes(result), ("invalid-executive-intelligence-package",)
+        )
+        self.assertIsNone(package.source_derived_artifact)
+
+    def test_rejects_package_metadata_conflicting_with_valid_artifact(self):
+        source = executive_package()
+        package = replace(
+            source,
+            assessment_version="conflicting-assessment",
+            lineage=replace(
+                source.lineage, assessment_version="conflicting-assessment"
+            ),
+        )
+        before = package.to_dict()
+
+        result = ExecutiveIntelligenceProjectionProjector().project(
+            ExecutiveIntelligenceProjectionRequest(), package
+        )
+
+        self.assertFalse(result.projected)
+        self.assertIsNone(result.projection)
+        self.assertEqual(issue_codes(result), ("inconsistent-package-lineage",))
+        self.assertEqual(package.to_dict(), before)
 
     def test_rejects_raw_snapshot(self):
         result = ExecutiveIntelligenceProjectionProjector().project(

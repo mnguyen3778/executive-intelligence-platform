@@ -1,6 +1,7 @@
 import copy
 import sys
 import unittest
+from dataclasses import replace
 from pathlib import Path
 
 
@@ -9,9 +10,14 @@ ASSESSMENT_SERVICE_ROOT = EIP_ROOT.parent / "nguyen-ai-assessment-service"
 
 sys.path.insert(0, str(EIP_ROOT / "src"))
 sys.path.insert(0, str(ASSESSMENT_SERVICE_ROOT / "src"))
+sys.path.insert(0, str(ASSESSMENT_SERVICE_ROOT / "tests"))
 
 from assessment.business_decision_package import (  # noqa: E402
     BUSINESS_DECISION_PACKAGE_CONTRACT_VERSION,
+    GOVERNED_BUSINESS_DECISION_PACKAGE_CONTRACT_VERSION,
+)
+from assessment.governed_assessment_input import (  # noqa: E402
+    EXECUTIVE_ASSESSMENT_VERSION_V2,
 )
 from assessment.executive_orchestration import (  # noqa: E402
     ValidatedCanonicalExecutiveAssessmentInput,
@@ -28,6 +34,7 @@ from assessment.methodology_config import (  # noqa: E402
     BUSINESS_DECISION_METHODOLOGY,
     METHODOLOGY_VERSION,
 )
+from test_golden_fixture_regression import request as golden_fixture_request  # noqa: E402
 from executive_intelligence_platform.executive_intelligence_package import (  # noqa: E402
     EXECUTIVE_INTELLIGENCE_PACKAGE_ASSEMBLY_RULE_VERSION,
     EXECUTIVE_INTELLIGENCE_PACKAGE_CONTRACT_VERSION,
@@ -53,6 +60,9 @@ from executive_intelligence_platform.snapshot_derivation import (  # noqa: E402
     SNAPSHOT_DERIVATION_RUNTIME_VERSION,
     SnapshotDerivationRequest,
     SnapshotDerivationRuntime,
+)
+from executive_intelligence_platform.snapshot_derivation.derivation import (  # noqa: E402
+    GOVERNED_CONTENT_DERIVATION_RULE_VERSION,
 )
 
 
@@ -150,6 +160,37 @@ def produce_projection_pipeline(serialized_snapshot=None):
     )
 
 
+def produce_governed_projection_pipeline():
+    production = produce_executive_assessment_snapshot(
+        golden_fixture_request(75, "mixed-strong", "two-high")
+    )
+    if not production.is_success:
+        raise AssertionError(production.failure)
+    snapshot = production.serialized_snapshot
+    compatibility = validate_snapshot_compatibility(snapshot)
+    catalog = SnapshotCatalog()
+    admission = catalog.admit(
+        snapshot, producer_snapshot_identity="fixture-v1-high-concentration-risk"
+    )
+    if not admission.accepted:
+        raise AssertionError(admission.issues)
+    derivation = SnapshotDerivationRuntime().derive(
+        admission.entry,
+        SnapshotDerivationRequest(GOVERNED_CONTENT_DERIVATION_RULE_VERSION),
+    )
+    if not derivation.derived:
+        raise AssertionError(derivation.issues)
+    packaged = ExecutiveIntelligencePackageAssembler().assemble(
+        ExecutiveIntelligencePackageRequest(), derivation.artifact
+    )
+    if not packaged.packaged:
+        raise AssertionError(packaged.issues)
+    projected = ExecutiveIntelligenceProjectionProjector().project(
+        ExecutiveIntelligenceProjectionRequest(), packaged.package
+    )
+    return snapshot, compatibility, admission, derivation, packaged, projected
+
+
 def issue_codes(result):
     return tuple(issue.code for issue in result.issues)
 
@@ -165,6 +206,288 @@ def contains_key(value, key_name):
 
 
 class CrossRepositoryExecutiveIntelligenceProjectionContractTests(unittest.TestCase):
+    def test_frozen_v2_fixture_projects_exact_governed_conclusions(self):
+        snapshot, compatibility, admission, derivation, packaged, projected = (
+            produce_governed_projection_pipeline()
+        )
+        self.assertTrue(compatibility.is_valid)
+        self.assertTrue(admission.accepted)
+        self.assertTrue(derivation.derived)
+        self.assertTrue(packaged.packaged)
+        self.assertTrue(projected.projected, projected.issues)
+        self.assertEqual(projected.issues, ())
+        projection = projected.projection
+        self.assertIs(projection.source_package, packaged.package)
+        self.assertIs(packaged.package.source_derived_artifact, derivation.artifact)
+
+        serialized = projection.to_dict()
+        source = serialized["sourcePackage"]["sourceDerivedArtifact"]
+        producer_package = snapshot["businessDecisionPackage"]
+        governed = source["governedConclusions"]
+        expected = producer_package["governedConclusions"]
+        self.assertEqual(governed, expected)
+        self.assertEqual(
+            tuple(governed),
+            (
+                "severityAssignedFindings",
+                "assessmentRisk",
+                "confidence",
+                "recommendations",
+                "executiveSummary",
+            ),
+        )
+        self.assertEqual(len(governed["severityAssignedFindings"]), 2)
+        self.assertEqual(
+            [finding["findingId"] for finding in governed["severityAssignedFindings"]],
+            [finding["findingId"] for finding in expected["severityAssignedFindings"]],
+        )
+        for finding, original in zip(
+            governed["severityAssignedFindings"], expected["severityAssignedFindings"]
+        ):
+            self.assertEqual(
+                finding["severityClassification"], original["severityClassification"]
+            )
+            self.assertEqual(finding["sourceReferences"], original["sourceReferences"])
+        self.assertEqual(governed["assessmentRisk"], expected["assessmentRisk"])
+        self.assertEqual(governed["confidence"], expected["confidence"])
+        self.assertEqual(governed["recommendations"], expected["recommendations"])
+        self.assertEqual(len(governed["recommendations"]), 2)
+        self.assertEqual(governed["executiveSummary"], expected["executiveSummary"])
+        self.assertEqual(len(governed["executiveSummary"]["sectionText"]), 7)
+
+        versions = producer_package["versionMetadata"]
+        self.assertEqual(
+            versions["contractVersion"],
+            GOVERNED_BUSINESS_DECISION_PACKAGE_CONTRACT_VERSION,
+        )
+        self.assertEqual(
+            source["catalogAdmissionMetadata"]["packageContractVersion"],
+            versions["contractVersion"],
+        )
+        self.assertEqual(
+            projection.snapshot_contract_version, snapshot["responseContractVersion"]
+        )
+        self.assertEqual(projection.assessment_version, EXECUTIVE_ASSESSMENT_VERSION_V2)
+        self.assertEqual(projection.assessment_version, versions["assessmentVersion"])
+        self.assertEqual(projection.methodology_version, versions["methodologyVersion"])
+        self.assertEqual(
+            projection.derivation_rule_version, GOVERNED_CONTENT_DERIVATION_RULE_VERSION
+        )
+        self.assertEqual(
+            projection.package_assembly_rule_version,
+            EXECUTIVE_INTELLIGENCE_PACKAGE_ASSEMBLY_RULE_VERSION,
+        )
+        self.assertEqual(
+            projection.projection_rule_version,
+            EXECUTIVE_INTELLIGENCE_PROJECTION_RULE_VERSION,
+        )
+        self.assertEqual(
+            projection.producer_snapshot_identity,
+            admission.entry.admission_metadata.producer_snapshot_identity,
+        )
+        self.assertEqual(
+            source["catalogAdmissionMetadata"]["sourceComponentIds"],
+            source["producerProvenance"]["sourceComponentIds"],
+        )
+        self.assertEqual(
+            source["producerProvenance"]["productionAuthority"],
+            NOT_PRODUCTION_AUTHORITATIVE,
+        )
+        self.assertEqual(
+            source["catalogAdmissionMetadata"]["productionAuthority"],
+            NOT_PRODUCTION_AUTHORITATIVE,
+        )
+
+    def test_frozen_v2_projection_is_deterministic_and_immutable(self):
+        snapshot, _compatibility, admission, derivation, packaged, projected = (
+            produce_governed_projection_pipeline()
+        )
+        before_snapshot = copy.deepcopy(snapshot)
+        before_entry = admission.entry.to_dict()
+        before_artifact = derivation.artifact.to_dict()
+        before_package = packaged.package.to_dict()
+        projector = ExecutiveIntelligenceProjectionProjector()
+        repeated = projector.project(
+            ExecutiveIntelligenceProjectionRequest(), packaged.package
+        )
+        self.assertEqual(projected.to_dict(), repeated.to_dict())
+        serialized = projected.projection.to_dict()
+        findings = serialized["sourcePackage"]["sourceDerivedArtifact"][
+            "governedConclusions"
+        ]["severityAssignedFindings"]
+        findings[0]["sourceReferences"].clear()
+        self.assertEqual(projected.projection.to_dict(), repeated.projection.to_dict())
+        self.assertEqual(packaged.package.to_dict(), before_package)
+        self.assertEqual(derivation.artifact.to_dict(), before_artifact)
+        self.assertEqual(admission.entry.to_dict(), before_entry)
+        self.assertEqual(snapshot, before_snapshot)
+
+    def test_frozen_v2_projection_rejects_invalid_embedded_artifacts(self):
+        _snapshot, _compatibility, _admission, derivation, packaged, _projected = (
+            produce_governed_projection_pipeline()
+        )
+        artifact = derivation.artifact
+
+        def changed_conclusions(change):
+            conclusions = copy.deepcopy(artifact.to_dict()["governedConclusions"])
+            change(conclusions)
+            return replace(artifact, governed_conclusions=conclusions)
+
+        missing = replace(artifact)
+        object.__setattr__(missing, "governed_conclusions", None)
+        unsupported_rule = replace(artifact)
+        object.__setattr__(
+            unsupported_rule, "derivation_rule_version", "unsupported-rule"
+        )
+        cases = (
+            ("missing conclusions", missing),
+            (
+                "malformed conclusions",
+                changed_conclusions(lambda c: c.__setitem__("confidence", {})),
+            ),
+            (
+                "missing source references",
+                changed_conclusions(
+                    lambda c: c["severityAssignedFindings"][0].__setitem__(
+                        "sourceReferences", []
+                    )
+                ),
+            ),
+            (
+                "finding order",
+                changed_conclusions(
+                    lambda c: c["severityAssignedFindings"].reverse()
+                ),
+            ),
+            (
+                "recommendation order",
+                changed_conclusions(lambda c: c["recommendations"].reverse()),
+            ),
+            ("unsupported derivation rule", unsupported_rule),
+            (
+                "unsupported producer package",
+                replace(
+                    artifact,
+                    catalog_admission_metadata=replace(
+                        artifact.catalog_admission_metadata,
+                        package_contract_version="business-decision-package-v3",
+                    ),
+                ),
+            ),
+            (
+                "conflicting assessment",
+                replace(artifact, assessment_version="conflicting-assessment"),
+            ),
+            (
+                "conflicting methodology",
+                replace(artifact, methodology_version="conflicting-methodology"),
+            ),
+            (
+                "conflicting source components",
+                replace(
+                    artifact,
+                    producer_provenance=replace(
+                        artifact.producer_provenance,
+                        source_component_ids=("decisionEvaluation",),
+                    ),
+                ),
+            ),
+            (
+                "conflicting snapshot lineage",
+                replace(artifact, producer_snapshot_identity="different-snapshot"),
+            ),
+            (
+                "invalid authority",
+                replace(
+                    artifact,
+                    catalog_admission_metadata=replace(
+                        artifact.catalog_admission_metadata,
+                        production_authority="UPGRADED",
+                    ),
+                    producer_provenance=replace(
+                        artifact.producer_provenance,
+                        production_authority="UPGRADED",
+                    ),
+                ),
+            ),
+        )
+        original = packaged.package.to_dict()
+        for name, invalid in cases:
+            with self.subTest(name=name):
+                package = replace(packaged.package, source_derived_artifact=invalid)
+                before = package.to_dict()
+                result = ExecutiveIntelligenceProjectionProjector().project(
+                    ExecutiveIntelligenceProjectionRequest(), package
+                )
+                self.assertFalse(result.projected)
+                self.assertIsNone(result.projection)
+                self.assertEqual(
+                    issue_codes(result), ("invalid-executive-intelligence-package",)
+                )
+                self.assertEqual(package.to_dict(), before)
+        self.assertEqual(packaged.package.to_dict(), original)
+
+    def test_frozen_v2_projection_rejects_conflicting_package_metadata(self):
+        _snapshot, _compatibility, _admission, _derivation, packaged, _projected = (
+            produce_governed_projection_pipeline()
+        )
+        original = packaged.package
+        cases = (
+            (
+                "assessment",
+                replace(
+                    original,
+                    assessment_version="conflicting-assessment",
+                    lineage=replace(
+                        original.lineage, assessment_version="conflicting-assessment"
+                    ),
+                ),
+            ),
+            (
+                "methodology",
+                replace(
+                    original,
+                    methodology_version="conflicting-methodology",
+                    lineage=replace(
+                        original.lineage, methodology_version="conflicting-methodology"
+                    ),
+                ),
+            ),
+            (
+                "snapshot identity",
+                replace(
+                    original,
+                    producer_snapshot_identity="different-snapshot",
+                    lineage=replace(
+                        original.lineage, producer_snapshot_identity="different-snapshot"
+                    ),
+                ),
+            ),
+            (
+                "source component lineage",
+                replace(
+                    original,
+                    lineage=replace(
+                        original.lineage,
+                        producer_provenance=replace(
+                            original.lineage.producer_provenance,
+                            source_component_ids=("decisionEvaluation",),
+                        ),
+                    ),
+                ),
+            ),
+        )
+        for name, package in cases:
+            with self.subTest(name=name):
+                before = package.to_dict()
+                result = ExecutiveIntelligenceProjectionProjector().project(
+                    ExecutiveIntelligenceProjectionRequest(), package
+                )
+                self.assertFalse(result.projected)
+                self.assertIsNone(result.projection)
+                self.assertIn("inconsistent-package-lineage", issue_codes(result))
+                self.assertEqual(package.to_dict(), before)
+
     def test_assessment_service_snapshot_progresses_to_projection(self):
         (
             _snapshot,

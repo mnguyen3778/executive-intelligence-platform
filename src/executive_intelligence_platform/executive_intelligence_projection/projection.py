@@ -15,7 +15,9 @@ from executive_intelligence_platform.executive_intelligence_package import (
     EXECUTIVE_INTELLIGENCE_PACKAGE_ASSEMBLY_RULE_VERSION,
     EXECUTIVE_INTELLIGENCE_PACKAGE_CONTRACT_VERSION,
     ExecutiveIntelligencePackage,
+    ExecutiveIntelligencePackageAssembler,
     ExecutiveIntelligencePackageLineage,
+    ExecutiveIntelligencePackageRequest,
 )
 
 
@@ -254,6 +256,25 @@ def _validate_package(
     issues.extend(_validate_package_lineage_completeness(package))
     if issues:
         return issues
+    canonical_result = ExecutiveIntelligencePackageAssembler().assemble(
+        ExecutiveIntelligencePackageRequest(), package.source_derived_artifact
+    )
+    if not canonical_result.packaged:
+        return [
+            _issue(
+                "invalid-executive-intelligence-package",
+                "$.package.sourceDerivedArtifact",
+                "Embedded derived artifact fails package assembly validation.",
+            )
+        ]
+    if package != canonical_result.package:
+        return [
+            _issue(
+                "inconsistent-package-lineage",
+                "$.package",
+                "Package fields or lineage conflict with the validated derived artifact.",
+            )
+        ]
     issues.extend(_validate_package_lineage_consistency(package))
     return issues
 
