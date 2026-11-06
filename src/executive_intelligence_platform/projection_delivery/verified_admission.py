@@ -35,6 +35,22 @@ from executive_intelligence_platform.snapshot_derivation import (
 from executive_intelligence_platform.snapshot_derivation.derivation import (
     GOVERNED_CONTENT_DERIVATION_RULE_VERSION,
 )
+from executive_intelligence_platform.snapshot_compatibility.compatibility import (
+    GOVERNED_ASSESSMENT_VERSION,
+    GOVERNED_CONCLUSION_FIELDS,
+    GOVERNED_PACKAGE_FIELD_ORDER,
+    GOVERNED_RECOMMENDATION_FIELDS,
+    RESPONSE_STATUS_FIELD_ORDER,
+    ROOT_FIELD_ORDER,
+    SUPPORTED_METHODOLOGY_VERSION,
+    SUPPORTED_RESPONSE_CONTRACT_VERSION,
+)
+
+
+LOCAL_V3_PACKAGE_VERSION = "business-decision-package-v3"
+_LOCAL_V3_RECOMMENDATION_FIELDS = GOVERNED_RECOMMENDATION_FIELDS + (
+    "recommendationActionText",
+)
 
 
 class VerifiedAdmissionError(ValueError):
@@ -74,6 +90,21 @@ class VerifiedSnapshotAdmission:
 
 
 @dataclass(frozen=True)
+class LocalV3GovernedProjection:
+    """Local read-only view of signed producer conclusions; no delivery type."""
+
+    _snapshot_bytes: bytes
+    evidence: VerificationEvidence
+
+    @property
+    def governed_conclusions(self) -> dict[str, Any]:
+        # Each access returns a copy; caller changes cannot alter admitted bytes.
+        return json.loads(self._snapshot_bytes)["businessDecisionPackage"][
+            "governedConclusions"
+        ]
+
+
+@dataclass(frozen=True)
 class VerifiedWebsiteDelivery:
     delivery: WebsiteProjectionDeliveryResult
     evidence: VerificationEvidence
@@ -95,7 +126,58 @@ class VerifiedSnapshotGateway:
             trusted_keys={trusted_key_id: trusted_public_key},
             expected_release_commit=expected_release_commit,
         )
+        self._trusted_issuer_id = trusted_issuer_id
+        self._trusted_key_id = trusted_key_id
+        self._trusted_public_key = trusted_public_key
+        self._expected_release_commit = expected_release_commit
         self._admission_marker = object()
+
+    def admit_local_v3(
+        self, snapshot_bytes: bytes, sidecar: object, *, package_contract_version: str,
+    ) -> LocalV3GovernedProjection:
+        """Explicit nonproduction admission; never enters catalog or delivery."""
+        if type(package_contract_version) is not str or package_contract_version != LOCAL_V3_PACKAGE_VERSION:
+            raise VerifiedAdmissionError("unsupported-local-package-version")
+        if type(snapshot_bytes) is not bytes:
+            raise VerifiedAdmissionError("invalid-snapshot-bytes")
+        try:
+            from assessment.producer_snapshot_attestation import (
+                ProducerSnapshotVerifier, V3_VERIFICATION_CONTRACT_VERSION,
+            )
+        except ImportError:
+            raise VerifiedAdmissionError("producer-v3-verifier-unavailable") from None
+        verifier = ProducerSnapshotVerifier(
+            trusted_issuer_id=self._trusted_issuer_id,
+            trusted_keys={self._trusted_key_id: self._trusted_public_key},
+            expected_release_commit=self._expected_release_commit,
+            verification_contract_version=V3_VERIFICATION_CONTRACT_VERSION,
+        )
+        try:
+            verifier.verify(snapshot_bytes, sidecar)
+        except ValueError as error:
+            code = getattr(error, "code", None)
+            raise VerifiedAdmissionError(
+                code.value if code is not None else "attestation-verification-failed"
+            ) from None
+        try:
+            snapshot = json.loads(snapshot_bytes)
+            compatible = _local_v3_contract_valid(snapshot)
+        except (ImportError, ValueError, TypeError, KeyError, IndexError, AttributeError):
+            compatible = False
+        if not compatible:
+            raise VerifiedAdmissionError("local-v3-contract-invalid")
+        return LocalV3GovernedProjection(
+            _snapshot_bytes=snapshot_bytes,
+            evidence=VerificationEvidence(
+                issuer_id=sidecar["issuerId"],
+                producer_release_commit=sidecar["producerReleaseCommit"],
+                producer_snapshot_identity=sidecar["producerSnapshotIdentity"],
+                snapshot_digest=sidecar["snapshotDigest"],
+                governed_conclusions_digest=sidecar["governedConclusionsDigest"],
+                verification_contract_version=sidecar["verificationContractVersion"],
+                key_id=sidecar["keyId"],
+            ),
+        )
 
     def _verified_entry(self, snapshot_bytes: bytes, sidecar: object):
         if type(snapshot_bytes) is not bytes:
@@ -228,3 +310,51 @@ class VerifiedSnapshotGateway:
                 evidence.producer_snapshot_identity):
             raise VerifiedAdmissionError("verified-chain-broken")
         return VerifiedWebsiteDelivery(delivery=delivered, evidence=evidence)
+
+
+def _local_v3_contract_valid(snapshot: object) -> bool:
+    """Consumer checks after independent signature and producer validation."""
+    from assessment.approved_methodology_runtime_config import (
+        APPROVED_RECOMMENDATION_ACTION_TEXT_BY_RULE,
+    )
+
+    if type(snapshot) is not dict or tuple(snapshot) != ROOT_FIELD_ORDER:
+        return False
+    status = snapshot.get("responseStatus")
+    package = snapshot.get("businessDecisionPackage")
+    if (snapshot.get("responseContractVersion") != SUPPORTED_RESPONSE_CONTRACT_VERSION
+            or type(status) is not dict or tuple(status) != RESPONSE_STATUS_FIELD_ORDER
+            or status["productionAuthority"] != "NOT_PRODUCTION_AUTHORITATIVE"
+            or type(package) is not dict or tuple(package) != GOVERNED_PACKAGE_FIELD_ORDER):
+        return False
+    metadata = package.get("versionMetadata")
+    governed = package.get("governedConclusions")
+    if (type(metadata) is not dict or
+            (metadata.get("contractVersion"), metadata.get("assessmentVersion"),
+             metadata.get("methodologyVersion")) !=
+            (LOCAL_V3_PACKAGE_VERSION, GOVERNED_ASSESSMENT_VERSION,
+             SUPPORTED_METHODOLOGY_VERSION) or
+            type(governed) is not dict or tuple(governed) != GOVERNED_CONCLUSION_FIELDS):
+        return False
+    findings = governed["severityAssignedFindings"]
+    recommendations = governed["recommendations"]
+    if (type(findings) is not list or type(recommendations) is not list or
+            len(recommendations) != max(1, len(findings))):
+        return False
+    finding_ids = [item["findingId"] for item in findings]
+    for index, recommendation in enumerate(recommendations):
+        if type(recommendation) is not dict or tuple(recommendation) != _LOCAL_V3_RECOMMENDATION_FIELDS:
+            return False
+        rule = recommendation["recommendationDecisionIdentifier"]
+        if (type(rule) is not str or
+                recommendation["recommendationDecisionTableVersion"] != "recommendation-decision-table-set-v1" or
+                recommendation["recommendationActionText"] !=
+                APPROVED_RECOMMENDATION_ACTION_TEXT_BY_RULE.get(rule) or
+                recommendation["findingId"] !=
+                (finding_ids[index] if finding_ids else None)):
+            return False
+    return bool(findings) or (
+        recommendations[0]["recommendationDecisionIdentifier"]
+        == "recommendation-v1-no-findings-monitor"
+        and recommendations[0]["recommendationClassification"] == "monitor"
+    )
