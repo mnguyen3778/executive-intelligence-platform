@@ -95,10 +95,26 @@ class LocalV3GovernedProjection:
 
     _snapshot_bytes: bytes
     evidence: VerificationEvidence
+    _sidecar_items: tuple[tuple[str, str], ...] = ()
+    _gateway_marker: object = None
 
     @property
     def governed_conclusions(self) -> dict[str, Any]:
         # Each access returns a copy; caller changes cannot alter admitted bytes.
+        return json.loads(self._snapshot_bytes)["businessDecisionPackage"][
+            "governedConclusions"
+        ]
+
+
+@dataclass(frozen=True)
+class LocalV3GovernedDelivery:
+    """Nonproduction local result; never a Website delivery contract."""
+
+    _snapshot_bytes: bytes
+    evidence: VerificationEvidence
+
+    @property
+    def governed_conclusions(self) -> dict[str, Any]:
         return json.loads(self._snapshot_bytes)["businessDecisionPackage"][
             "governedConclusions"
         ]
@@ -140,6 +156,7 @@ class VerifiedSnapshotGateway:
             raise VerifiedAdmissionError("unsupported-local-package-version")
         if type(snapshot_bytes) is not bytes:
             raise VerifiedAdmissionError("invalid-snapshot-bytes")
+        candidate = dict(sidecar) if type(sidecar) is dict else sidecar
         try:
             from assessment.producer_snapshot_attestation import (
                 ProducerSnapshotVerifier, V3_VERIFICATION_CONTRACT_VERSION,
@@ -153,7 +170,7 @@ class VerifiedSnapshotGateway:
             verification_contract_version=V3_VERIFICATION_CONTRACT_VERSION,
         )
         try:
-            verifier.verify(snapshot_bytes, sidecar)
+            verifier.verify(snapshot_bytes, candidate)
         except ValueError as error:
             code = getattr(error, "code", None)
             raise VerifiedAdmissionError(
@@ -169,14 +186,38 @@ class VerifiedSnapshotGateway:
         return LocalV3GovernedProjection(
             _snapshot_bytes=snapshot_bytes,
             evidence=VerificationEvidence(
-                issuer_id=sidecar["issuerId"],
-                producer_release_commit=sidecar["producerReleaseCommit"],
-                producer_snapshot_identity=sidecar["producerSnapshotIdentity"],
-                snapshot_digest=sidecar["snapshotDigest"],
-                governed_conclusions_digest=sidecar["governedConclusionsDigest"],
-                verification_contract_version=sidecar["verificationContractVersion"],
-                key_id=sidecar["keyId"],
+                issuer_id=candidate["issuerId"],
+                producer_release_commit=candidate["producerReleaseCommit"],
+                producer_snapshot_identity=candidate["producerSnapshotIdentity"],
+                snapshot_digest=candidate["snapshotDigest"],
+                governed_conclusions_digest=candidate["governedConclusionsDigest"],
+                verification_contract_version=candidate["verificationContractVersion"],
+                key_id=candidate["keyId"],
             ),
+            _sidecar_items=tuple(candidate.items()),
+            _gateway_marker=self._admission_marker,
+        )
+
+    def deliver_local_v3(
+        self, admission: object, *, package_contract_version: str,
+    ) -> LocalV3GovernedDelivery:
+        """Reverify exact signed v3 bytes for one explicitly selected local use."""
+        if (type(admission) is not LocalV3GovernedProjection or
+                admission._gateway_marker is not self._admission_marker):
+            raise VerifiedAdmissionError("unverified-local-v3-input")
+        try:
+            sidecar = dict(admission._sidecar_items)
+        except (TypeError, ValueError):
+            raise VerifiedAdmissionError("invalid-local-v3-evidence") from None
+        verified = self.admit_local_v3(
+            admission._snapshot_bytes, sidecar,
+            package_contract_version=package_contract_version,
+        )
+        if verified.evidence != admission.evidence:
+            raise VerifiedAdmissionError("verified-evidence-mismatch")
+        return LocalV3GovernedDelivery(
+            _snapshot_bytes=verified._snapshot_bytes,
+            evidence=verified.evidence,
         )
 
     def _verified_entry(self, snapshot_bytes: bytes, sidecar: object):
