@@ -3,6 +3,7 @@
 import sys
 import unittest
 from dataclasses import FrozenInstanceError, replace
+from hashlib import sha256
 from pathlib import Path
 from unittest.mock import patch
 
@@ -19,7 +20,11 @@ from executive_intelligence_platform.projection_delivery.non_production_v3_publi
     APPROVED_FIELD_SCOPE, RECOMMENDATION_DECISION_TABLE_VERSION,
     SyntheticV3AuthoritySnapshot, SyntheticV3CurrentState,
     SyntheticV3PublicationRecord, SyntheticV3Selector,
-    _integrity, synthetic_v3_artifact_identity, verify_synthetic_v3_publication,
+    verify_synthetic_v3_publication,
+)
+from executive_intelligence_platform.projection_delivery.non_production_v3_serialized_artifact import (  # noqa: E402
+    SERIALIZATION_PROFILE_VERSION, SyntheticV3ArtifactScope,
+    create_synthetic_v3_artifact,
 )
 from executive_intelligence_platform.projection_delivery.recommendation_action_explain_delivery import (  # noqa: E402
     RECOMMENDATION_ACTION_EXPLAIN_DELIVERY_CONTRACT_VERSION as DELIVERY_V1,
@@ -44,9 +49,19 @@ class SyntheticV3PublicationTests(unittest.TestCase):
             self.gateway, self.admission, package_contract_version=fixtures.V3,
             delivery_contract_version=DELIVERY_V1)
         projection = self.candidate.verified_projection
+        self.scope = SyntheticV3ArtifactScope(
+            "synthetic-business-entity", "synthetic-environment",
+            "synthetic-engagement", True)
+        self.artifact = create_synthetic_v3_artifact(
+            self.candidate, self.gateway, self.admission,
+            artifact_instance_id="synthetic-artifact-instance-A",
+            trusted_scope=self.scope)
         self.record = SyntheticV3PublicationRecord(
-            artifact_identity=synthetic_v3_artifact_identity(self.candidate),
-            artifact_integrity_reference=_integrity(self.candidate),
+            artifact_identity=self.artifact.artifact_instance_id,
+            artifact_integrity_reference=self.artifact.integrity_reference,
+            artifact_serialized_bytes=self.artifact.serialized_bytes,
+            artifact_scope=self.scope,
+            serialization_profile_version=SERIALIZATION_PROFILE_VERSION,
             occurrence="synthetic-occurrence-A", revision="synthetic-revision-1",
             series="synthetic-series-A",
             producer_snapshot_identity=projection.producer_snapshot_identity,
@@ -66,14 +81,17 @@ class SyntheticV3PublicationTests(unittest.TestCase):
                                             self.fixture.generation)
 
     def verify(self, *, selector=None, candidate=None, authority=None,
-               trusted_fixture=None, gateway=None, admission=None):
+               trusted_fixture=None, gateway=None, admission=None,
+               artifact=None, trusted_scope=None):
         return verify_synthetic_v3_publication(
             self.selector if selector is None else selector,
             self.candidate if candidate is None else candidate,
             self.fixture if authority is None else authority,
             trusted_fixture=self.fixture if trusted_fixture is None else trusted_fixture,
             gateway=self.gateway if gateway is None else gateway,
-            admission=self.admission if admission is None else admission)
+            admission=self.admission if admission is None else admission,
+            artifact=self.artifact if artifact is None else artifact,
+            trusted_scope=self.scope if trusted_scope is None else trusted_scope)
 
     def rejected(self, reason, **kwargs):
         result = self.verify(**kwargs)
@@ -151,6 +169,11 @@ class SyntheticV3PublicationTests(unittest.TestCase):
             ("artifact_identity", "synthetic-other", "artifact-identity-mismatch"),
             ("artifact_integrity_reference", "sha256:" + "0" * 64,
              "artifact-integrity-mismatch"),
+            ("artifact_serialized_bytes", b"forged-bytes",
+             "artifact-integrity-mismatch"),
+            ("artifact_scope", replace(self.scope, business_entity_id="other"),
+             "artifact-scope-mismatch"),
+            ("serialization_profile_version", "other-profile", "malformed-evidence"),
             ("producer_snapshot_identity", "other-snapshot",
              "producer-lineage-mismatch"),
             ("verification_evidence", replace(self.record.verification_evidence,
@@ -168,6 +191,26 @@ class SyntheticV3PublicationTests(unittest.TestCase):
                 record = replace(self.record, **{field: value})
                 authority = self.fixture_state(record)
                 self.under_fixture(authority, reason)
+
+    def test_artifact_bytes_and_conflicting_instance_claims_reject(self):
+        altered = replace(self.artifact, serialized_bytes=b"forged-bytes",
+                          integrity_reference="sha256:" +
+                          sha256(b"forged-bytes").hexdigest())
+        self.rejected("artifact-integrity-mismatch", artifact=altered)
+        self.rejected("artifact-evidence-missing", artifact=False)
+        self.rejected("artifact-evidence-missing", trusted_scope=False)
+        conflicting = replace(self.record, occurrence="synthetic-occurrence-B",
+                              series="synthetic-series-B",
+                              artifact_integrity_reference="sha256:" + "0" * 64)
+        state = replace(self.state, occurrence=conflicting.occurrence)
+        self.under_fixture(self.fixture_state(self.record, conflicting,
+                           states=(self.state, state)),
+                           "conflicting-artifact-instance-claims")
+        alias = replace(self.record, artifact_identity=self.record.occurrence)
+        selected = replace(self.selector, artifact_identity=alias.artifact_identity)
+        authority = self.fixture_state(alias)
+        self.rejected("artifact-identity-mismatch", selector=selected,
+                      authority=authority, trusted_fixture=authority)
 
     def test_missing_conflicting_and_ambiguous_state_reject(self):
         self.under_fixture(self.fixture_state(states=()), "missing-current-state")

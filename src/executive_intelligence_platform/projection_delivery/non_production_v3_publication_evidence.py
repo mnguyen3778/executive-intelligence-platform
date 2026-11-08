@@ -7,9 +7,7 @@ protocol. No live source, publication mutation, or client serializer exists here
 
 from __future__ import annotations
 
-import json
-from dataclasses import asdict, dataclass, field
-from hashlib import sha256
+from dataclasses import dataclass, field
 
 from .recommendation_action_explain_delivery import (
     RECOMMENDATION_ACTION_EXPLAIN_DELIVERY_CONTRACT_VERSION,
@@ -19,6 +17,10 @@ from .recommendation_action_explain_delivery import (
 from .verified_admission import (
     LOCAL_V3_PACKAGE_VERSION, VerificationEvidence, VerifiedAdmissionError,
     VerifiedSnapshotGateway,
+)
+from .non_production_v3_serialized_artifact import (
+    SERIALIZATION_PROFILE_VERSION, SyntheticV3ArtifactScope,
+    SyntheticV3SerializedArtifact, verify_synthetic_v3_artifact,
 )
 from executive_intelligence_platform.snapshot_compatibility.compatibility import (
     SUPPORTED_METHODOLOGY_VERSION,
@@ -38,6 +40,9 @@ class SyntheticV3PublicationRecord:
 
     artifact_identity: str
     artifact_integrity_reference: str
+    artifact_serialized_bytes: bytes
+    artifact_scope: SyntheticV3ArtifactScope
+    serialization_profile_version: str
     occurrence: str
     revision: str
     series: str
@@ -99,24 +104,6 @@ def _name(value: object) -> bool:
     return type(value) is str and bool(value.strip())
 
 
-def _integrity(candidate: InternalRecommendationActionExplainDeliveryCandidate) -> str:
-    """Digest the trusted internal projection, including producer lineage."""
-    data = {
-        "deliveryContractVersion": candidate.delivery_contract_version,
-        "verifiedProjection": asdict(candidate.verified_projection),
-    }
-    canonical = json.dumps(data, sort_keys=True, separators=(",", ":"),
-                           ensure_ascii=False).encode("utf-8")
-    return "sha256:" + sha256(canonical).hexdigest()
-
-
-def synthetic_v3_artifact_identity(
-    candidate: InternalRecommendationActionExplainDeliveryCandidate,
-) -> str:
-    """Deterministic local artifact name, independent of publication occurrence."""
-    return "synthetic-v3-artifact:" + _integrity(candidate)[7:]
-
-
 def verify_synthetic_v3_publication(
     selector: object,
     candidate: object,
@@ -125,6 +112,8 @@ def verify_synthetic_v3_publication(
     trusted_fixture: object,
     gateway: object,
     admission: object,
+    artifact: object,
+    trusted_scope: object,
 ) -> SyntheticV3VerificationResult:
     """Check one fixture-held current state; a PASS never authorizes delivery."""
     if (type(selector) is not SyntheticV3Selector or
@@ -142,6 +131,9 @@ def verify_synthetic_v3_publication(
         return _reject("synthetic-fixture-missing")
     if type(authority) is not SyntheticV3AuthoritySnapshot:
         return _reject("publication-evidence-missing")
+    if (type(artifact) is not SyntheticV3SerializedArtifact or
+            type(trusted_scope) is not SyntheticV3ArtifactScope):
+        return _reject("artifact-evidence-missing")
     if (not _name(authority.generation) or type(authority.available) is not bool or
             type(authority.records) is not tuple or
             type(authority.current_states) is not tuple or
@@ -159,6 +151,7 @@ def verify_synthetic_v3_publication(
 
     records: dict[str, SyntheticV3PublicationRecord] = {}
     revisions: set[tuple[str, str]] = set()
+    instance_claims: dict[str, tuple[object, ...]] = {}
     for record in authority.records:
         if (type(record) is not SyntheticV3PublicationRecord or
                 not all(_name(v) for v in (
@@ -168,9 +161,22 @@ def verify_synthetic_v3_publication(
                     record.methodology_version, record.decision_table_version,
                     record.delivery_contract_version)) or
                 type(record.verification_evidence) is not VerificationEvidence or
+                type(record.artifact_serialized_bytes) is not bytes or
+                type(record.artifact_scope) is not SyntheticV3ArtifactScope or
+                record.serialization_profile_version != SERIALIZATION_PROFILE_VERSION or
                 type(record.field_scope) is not tuple or
                 not all(_name(v) for v in record.field_scope)):
             return _reject("malformed-evidence")
+        claim = (record.artifact_serialized_bytes,
+                 record.artifact_integrity_reference, record.artifact_scope,
+                 record.serialization_profile_version,
+                 record.producer_snapshot_identity, record.verification_evidence,
+                 record.package_version, record.methodology_version,
+                 record.decision_table_version, record.field_scope,
+                 record.delivery_contract_version)
+        previous = instance_claims.setdefault(record.artifact_identity, claim)
+        if previous != claim:
+            return _reject("conflicting-artifact-instance-claims")
         if record.occurrence in records or (record.series, record.revision) in revisions:
             return _reject("conflicting-publication-records")
         records[record.occurrence] = record
@@ -234,15 +240,23 @@ def verify_synthetic_v3_publication(
                     RECOMMENDATION_DECISION_TABLE_VERSION
                     for row in projection.recommendations)):
             return _reject("invalid-v3-candidate")
-        integrity = _integrity(fresh)
-        identity = synthetic_v3_artifact_identity(fresh)
     except (VerifiedAdmissionError, TypeError, ValueError, AttributeError, KeyError):
         return _reject("invalid-v3-candidate")
 
-    if record.artifact_identity != identity:
+    if record.artifact_identity != artifact.artifact_instance_id:
         return _reject("artifact-identity-mismatch")
-    if record.artifact_integrity_reference != integrity:
+    if (record.artifact_integrity_reference != artifact.integrity_reference or
+            record.artifact_serialized_bytes != artifact.serialized_bytes):
         return _reject("artifact-integrity-mismatch")
+    if record.artifact_scope != trusted_scope:
+        return _reject("artifact-scope-mismatch")
+    if not verify_synthetic_v3_artifact(
+            artifact, fresh, gateway, admission,
+            expected_artifact_instance_id=record.artifact_identity,
+            trusted_scope=trusted_scope):
+        return _reject("invalid-serialized-artifact")
+    if record.artifact_identity in (record.occurrence, record.revision):
+        return _reject("artifact-identity-mismatch")
     if (record.producer_snapshot_identity != projection.producer_snapshot_identity or
             record.producer_snapshot_identity !=
             projection.verification_evidence.producer_snapshot_identity or
@@ -257,6 +271,8 @@ def verify_synthetic_v3_publication(
         return _reject("v3-contract-mismatch")
     return SyntheticV3VerificationResult(
         "SYNTHETIC_ACCEPTED",
-        evidence=SyntheticV3VerifiedIdentity(identity, integrity, record.occurrence,
+        evidence=SyntheticV3VerifiedIdentity(record.artifact_identity,
+                                             record.artifact_integrity_reference,
+                                             record.occurrence,
                                              record.revision, authority.generation),
     )
